@@ -1,0 +1,26 @@
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.htpasswd
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+data/
+images/
+
+# OS files
+.DS_Store
