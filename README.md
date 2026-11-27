@@ -4,13 +4,13 @@ A lightweight browser interface for an existing Atomic Server public API. It pro
 
 ## One-shot install
 
-Run this as the user who will run the WebUI. The installer is available at the URL once `install.sh` and the application are published on `main`.
+Run this as the user who will run the WebUI.
 
 ```sh
-bash -o pipefail -c 'curl -q -fsSL --proto "=https" --proto-redir "=https" https://raw.githubusercontent.com/VA3KWJ/ATC-WebUI/main/install.sh | sh'
+curl -fsSLo atc-webui-install.sh https://raw.githubusercontent.com/VA3KWJ/ATC-WebUI/main/install.sh && sh atc-webui-install.sh
 ```
 
-The command requires Bash, curl, and working HTTPS trust to fetch the installer. Bash's `pipefail` reports download failures. On systems without Bash, download the script with the same curl options and run `sh install.sh` after a successful download. The installer reads `/etc/os-release` (or `/usr/lib/os-release`) and checks for Python 3.10+ with SSL, curl, and CA certificates. Where needed it installs prerequisites through APT, DNF, pacman, APK, or Zypper using root, `sudo`, or `doas`. Use a release with Python 3.10+ available.
+The command requires curl, `sh`, and working HTTPS trust. It saves the installer in the current directory and runs it after the download succeeds. The installer reads `/etc/os-release` (or `/usr/lib/os-release`) and checks for Python 3.10+ with SSL, curl, and CA certificates. Where needed it installs prerequisites through APT, DNF, pacman, APK, or Zypper using root, `sudo`, or `doas`. Use a release with Python 3.10+ available.
 
 The script supports Debian and Ubuntu, Fedora, RHEL and compatible distributions, Arch, Alpine, openSUSE, and derivatives identified through `ID_LIKE`. It installs these files for the current user.
 
@@ -25,10 +25,8 @@ The installer honors absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` values and p
 To pin both the script and the application archive to a published commit, set `ref` to the full commit SHA.
 
 ```sh
-ATC_WEBUI_REF='<full-commit-sha>' bash -o pipefail -c '
-  curl -q -fsSL --proto "=https" --proto-redir "=https" \
-    "https://raw.githubusercontent.com/VA3KWJ/ATC-WebUI/$ATC_WEBUI_REF/install.sh" | sh
-'
+ref='<full-commit-sha>'
+curl -fsSLo atc-webui-install.sh "https://raw.githubusercontent.com/VA3KWJ/ATC-WebUI/$ref/install.sh" && ATC_WEBUI_REF="$ref" sh atc-webui-install.sh
 ```
 
 ## Configure and run
