@@ -9,6 +9,7 @@ const ACTIVE_KEY = "atomic-webui.active";
 const pendingHistoryWrites = new Map();
 const THEME_KEY = "atomic-webui.theme";
 const MAX_CHAT_REQUEST = 256 * 1024;
+const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
 const encoder = new TextEncoder();
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 const state = {
@@ -17,7 +18,7 @@ const state = {
   models: [],
   loadingModels: false,
   chatRequest: null,
-  imageBusy: false,
+  imageRequest: null,
   imageEnabled: false,
   previewUrl: null,
 };
@@ -28,6 +29,10 @@ const errors = {
   model_unavailable: "The selected model is unavailable. Refresh models and choose another.",
   image_model_unavailable: "Image generation is disabled in the WebUI configuration.",
   image_model_not_loaded: "The requested image model is unavailable. Load it in Atomic Server and try again.",
+  image_control_unavailable: "Could not reach Atomic's local image job API. Check the WebUI configuration.",
+  image_cancelled: "Image generation stopped.",
+  image_out_of_memory: "Atomic ran out of memory while generating the image.",
+  image_stream_interrupted: "Image progress was interrupted. Try again.",
   image_busy: "The server is already generating images. Try again shortly.",
   invalid_prompt: "Enter an image prompt.",
   invalid_messages: "The conversation could not be sent. Start a new conversation and try again.",
@@ -219,7 +224,10 @@ function updateControls() {
   elements.stop.disabled = Boolean(state.chatRequest?.signal.aborted);
   elements["new-chat"].disabled = chatting;
   elements.refresh.disabled = chatting || state.loadingModels;
-  elements.generate.disabled = !state.imageEnabled || state.imageBusy;
+  elements.generate.disabled = !state.imageEnabled || Boolean(state.imageRequest);
+  elements["stop-image"].hidden = !state.imageRequest;
+  elements["stop-image"].disabled = Boolean(state.imageRequest?.signal.aborted);
+  elements["image-progress"].hidden = !state.imageRequest;
 }
 
 function renderModels(previous) {
@@ -269,7 +277,7 @@ async function refreshModels() {
   const previous = elements.model.value;
   updateControls();
   feedback("api-status", "API · Checking…");
-  feedback("model-status", "Models · Checking…");
+  feedback("model-status", "Chat models · Checking…");
   try {
     const response = await request("/api/models");
     const body = await response.json();
@@ -282,12 +290,12 @@ async function refreshModels() {
     state.models = body.models;
     feedback("api-status", "API · Available", "available");
     const count = state.models.length;
-    feedback("model-status", count ? `Models · ${count} available` : "Models · None available",
+    feedback("model-status", count ? `Chat models · ${count} available` : "Chat models · None available",
       count ? "available" : "");
   } catch (error) {
     state.models = [];
     feedback("api-status", `API · ${error.message}`, "error");
-    feedback("model-status", "Models · Availability unknown");
+    feedback("model-status", "Chat models · Availability unknown");
   } finally {
     state.loadingModels = false;
     renderModels(previous);
@@ -342,8 +350,8 @@ function chatPayload(model, history, message) {
   return { model, messages: [...history.slice(start), message] };
 }
 
-async function readChat(response, onDelta) {
-  const interrupted = new Error(errors.stream_interrupted);
+async function readEvents(response, interruptedMessage, events, onEvent) {
+  const interrupted = new Error(interruptedMessage);
   if (!response.headers.get("Content-Type")?.startsWith("text/event-stream") || !response.body) {
     throw new Error(errors.invalid_upstream_response);
   }
@@ -364,16 +372,15 @@ async function readChat(response, onDelta) {
         const data = lines.filter((line) => line.startsWith("data:"))
           .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
         if (event === "done") return;
-        if (event === "delta" || event === "error") {
+        if (event === "error" || events.includes(event)) {
           let payload;
           try {
             payload = JSON.parse(data);
           } catch {
             throw interrupted;
           }
-          if (event === "error") throw new Error(describeError(payload?.error, interrupted.message));
-          if (typeof payload?.text !== "string") throw interrupted;
-          onDelta(payload.text);
+          if (event === "error") throw new Error(describeError(payload?.error, interruptedMessage));
+          onEvent(event, payload);
         }
         boundary = /\r?\n\r?\n/.exec(pending);
       }
@@ -382,6 +389,13 @@ async function readChat(response, onDelta) {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
+}
+
+function readChat(response, onDelta) {
+  return readEvents(response, errors.stream_interrupted, ["delta"], (event, payload) => {
+    if (typeof payload?.text !== "string") throw new Error(errors.stream_interrupted);
+    onDelta(payload.text);
+  });
 }
 
 async function submitChat(event) {
@@ -487,17 +501,88 @@ function clearPreview() {
   state.previewUrl = null;
 }
 
+const imagePhases = {
+  queued: "Image queued…",
+  encoding: "Preparing image…",
+  sampling: "Generating image…",
+  decoding: "Decoding image…",
+  postprocessing: "Processing image…",
+  saving: "Saving image…",
+};
+
+function showImageProgress(progress) {
+  const bar = elements["image-progress-bar"];
+  if (Number.isFinite(progress?.fraction) && progress.fraction >= 0 && progress.fraction <= 1) {
+    bar.value = progress.fraction;
+  } else {
+    bar.removeAttribute("value");
+  }
+  const phase = Object.hasOwn(imagePhases, progress?.phase) ? imagePhases[progress.phase] : imagePhases.sampling;
+  const details = [phase];
+  if (progress?.phase === "sampling" && Number.isInteger(progress.step) && Number.isInteger(progress.totalSteps)
+      && progress.totalSteps > 0 && progress.step >= 0 && progress.step <= progress.totalSteps) {
+    details.push(`${progress.step}/${progress.totalSteps} steps`);
+  }
+  if (Number.isFinite(progress?.etaSeconds) && progress.etaSeconds > 0) {
+    details.push(`~${Math.ceil(progress.etaSeconds)}s remaining`);
+  }
+  const message = details.join(" · ");
+  if (message !== elements["image-status"].textContent) feedback("image-status", message);
+}
+
+async function readImage(response) {
+  if (!response.headers.get("Content-Type")?.startsWith("text/event-stream")) {
+    feedback("image-status", "Receiving image…");
+    return response.blob();
+  }
+  const chunks = [];
+  let size = 0;
+  await readEvents(response, errors.image_stream_interrupted, ["progress", "image"], (event, payload) => {
+    if (event === "progress") showImageProgress(payload);
+    if (event !== "image") return;
+    if (typeof payload?.data !== "string" || !payload.data || payload.data.length > 64 * 1024) {
+      throw new Error(errors.invalid_upstream_response);
+    }
+    let bytes;
+    try {
+      bytes = Uint8Array.from(atob(payload.data), (character) => character.charCodeAt(0));
+    } catch {
+      throw new Error(errors.invalid_upstream_response);
+    }
+    size += bytes.byteLength;
+    if (size > MAX_IMAGE_BYTES) throw new Error(errors.upstream_response_too_large);
+    if (!chunks.length) feedback("image-status", "Receiving image…");
+    chunks.push(bytes);
+  });
+  if (!size) throw new Error(errors.image_stream_interrupted);
+  return new Blob(chunks, { type: "image/png" });
+}
+
 async function submitImage(event) {
   event.preventDefault();
   const prompt = elements["image-prompt"].value.trim();
-  if (!prompt || !state.imageEnabled || state.imageBusy) return;
-  state.imageBusy = true;
+  if (!prompt || !state.imageEnabled || state.imageRequest) return;
+  const controller = new AbortController();
+  state.imageRequest = controller;
+  elements["image-progress-bar"].removeAttribute("value");
+  const started = performance.now();
+  const updateElapsed = () => {
+    const seconds = Math.floor((performance.now() - started) / 1000);
+    const minutes = Math.floor(seconds / 60);
+    elements["image-elapsed"].textContent = `Elapsed ${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+  };
+  updateElapsed();
+  const elapsedTimer = setInterval(updateElapsed, 1000);
   clearPreview();
   updateControls();
   feedback("image-status", "Generating image…");
   try {
-    const response = await postJson("/api/images", { prompt });
-    const blob = await response.blob();
+    const response = await postJson("/api/images", { prompt }, {
+      signal: controller.signal,
+      headers: { Accept: "text/event-stream", "X-ATC-Cancel-On-Disconnect": "1" },
+    });
+    const blob = await readImage(response);
+    controller.signal.throwIfAborted();
     if (!["image/png", "image/jpeg", "image/webp"].includes(blob.type)) {
       throw new Error(errors.invalid_upstream_response);
     }
@@ -506,14 +591,17 @@ async function submitImage(event) {
     await elements["generated-image"].decode().catch(() => {
       throw new Error("The generated image could not be displayed.");
     });
+    controller.signal.throwIfAborted();
     elements["image-caption"].textContent = prompt;
     elements.preview.hidden = false;
     feedback("image-status", "Image ready.");
   } catch (error) {
     clearPreview();
-    feedback("image-status", error.message, "error");
+    feedback("image-status", controller.signal.aborted ? "Image generation stopped." : error.message,
+      controller.signal.aborted ? "" : "error");
   } finally {
-    state.imageBusy = false;
+    clearInterval(elapsedTimer);
+    state.imageRequest = null;
     updateControls();
   }
 }
@@ -554,6 +642,10 @@ elements.stop.addEventListener("click", () => {
   updateControls();
 });
 elements["image-form"].addEventListener("submit", submitImage);
+elements["stop-image"].addEventListener("click", () => {
+  state.imageRequest?.abort();
+  updateControls();
+});
 
 loadHistory();
 renderConversation();

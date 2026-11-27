@@ -10,6 +10,7 @@ ATC_API_TOKEN_FILE. Prefer a mode 0600 file outside the checkout owned by the
 service account. ATC_WEBUI_HOST and ATC_WEBUI_PORT default to 127.0.0.1 and
 8080. Set ATC_WEBUI_PUBLIC_ORIGIN for a reverse proxy or wildcard bind.
 ATC_WEBUI_IMAGE_MODEL and ATC_WEBUI_GALLERY_URL are optional.
+ATC_WEBUI_CONTROL_DATA_DIR optionally enables local image job progress.
 """
 
 import base64
@@ -26,6 +27,7 @@ import socket
 import stat
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -48,6 +50,13 @@ MAX_CLIENTS = 16
 MAX_IMAGE_CLIENTS = 2
 IO_TIMEOUT = 15
 REQUEST_TIMEOUT = 180
+IMAGE_TIMEOUT = 600
+CONTROL_TIMEOUT = 5
+IMAGE_POLL_INTERVAL = 0.5
+IMAGE_CHUNK_SIZE = 48 * 1024
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+IMAGE_JOB_ID = re.compile(r"[0-9a-f]{32}")
+IMAGE_PHASES = ("queued", "encoding", "sampling", "decoding", "postprocessing", "saving")
 BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/\-]+=*")
 PATH_SEPARATOR = re.compile(r"[/\\]")
 PATH_DELIMITER = re.compile(r"""[\s"'<>()[\]{},;]""")
@@ -136,6 +145,7 @@ class Config:
     image_model: str | None
     gallery_url: str | None
     token: str = field(repr=False)
+    control_data_dir: Path | None = None
 
     @classmethod
     def from_env(cls, env):
@@ -163,9 +173,13 @@ class Config:
             token = read_token(env)
             if gallery and token in gallery:
                 raise ConfigurationError
+            control_dir = env.get("ATC_WEBUI_CONTROL_DATA_DIR")
+            if control_dir and not Path(control_dir).is_absolute():
+                raise ConfigurationError
             return cls(
                 address, port, origin(upstream), public_origin,
                 env.get("ATC_WEBUI_IMAGE_MODEL"), gallery, token,
+                Path(control_dir) if control_dir else None,
             )
         except ConfigurationError:
             raise
@@ -180,7 +194,7 @@ def close_socket(connection):
         pass
 
 
-def cancel_on_disconnect(client, upstream, finished):
+def cancel_on_disconnect(client, cancel, finished):
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(client, selectors.EVENT_READ)
@@ -192,10 +206,137 @@ def cancel_on_disconnect(client, upstream, finished):
                         return
                 except ConnectionError:
                     pass
-                close_socket(upstream)
+                cancel()
                 return
     except (OSError, ValueError):
         return
+
+
+class AtomicImageControl:
+    """Server-only access to the local Atomic daemon from an operator-selected data directory."""
+
+    def __init__(self, directory):
+        try:
+            descriptor = os.open(directory / "atc/run/daemon.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as metadata:
+                info = os.fstat(metadata.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                    raise ConfigurationError
+                raw = metadata.read(16385)
+                if len(raw) > 16384:
+                    raise ConfigurationError
+                daemon = json.loads(raw)
+            if not isinstance(daemon, dict) or daemon.get("state") != "ready":
+                raise ConfigurationError
+            pid = daemon.get("pid")
+            if type(pid) is not int or pid <= 0:
+                raise ConfigurationError
+            os.kill(pid, 0)
+            self.url = parse_url(daemon.get("control_url", ""))
+            if (self.url.scheme != "http" or not ipaddress.ip_address(self.url.hostname).is_loopback
+                    or self.url.path not in {"", "/"}):
+                raise ConfigurationError
+            self.token = read_token({"ATC_API_TOKEN_FILE": directory / "atomic-core/control-token"})
+        except (OSError, TypeError, ValueError, OverflowError, RecursionError):
+            raise APIError(502, "image_control_unavailable") from None
+
+    def call(self, route, payload=None):
+        connection = http.client.HTTPConnection(self.url.hostname, self.url.port, timeout=CONTROL_TIMEOUT)
+        deadline = None
+        try:
+            connection.connect()
+            deadline = threading.Timer(CONTROL_TIMEOUT, close_socket, args=(connection.sock,))
+            deadline.daemon = True
+            deadline.start()
+            headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+            body = None if payload is None else json.dumps(payload).encode()
+            connection.request("GET" if body is None else "POST", "/atomic/v1/diffusion" + route, body, headers)
+            with connection.getresponse() as response:
+                if response.status in {401, 403, 405}:
+                    raise APIError(502, "image_control_unavailable")
+                data = WebUIHandler.upstream_json(response, MAX_DISCOVERY)
+                if not isinstance(data, dict):
+                    raise APIError(502, "invalid_upstream_response")
+                if response.status != 200:
+                    self.raise_job_error(data.get("error"))
+                return data
+        except (OSError, http.client.HTTPException, ValueError, RecursionError):
+            raise APIError(502, "image_control_unavailable") from None
+        finally:
+            if deadline is not None:
+                deadline.cancel()
+            connection.close()
+
+    @staticmethod
+    def raise_job_error(error):
+        code = error.get("code") if isinstance(error, dict) else None
+        if code in ("MODEL_NOT_LOADED", "MODEL_INCOMPATIBLE", "NOT_CONFIGURED", "ENGINE_MISSING"):
+            raise APIError(503, "image_model_not_loaded")
+        if code in ("JOB_BUSY", "GPU_BUSY", "QUEUE_FULL"):
+            raise APIError(503, "image_busy")
+        if code == "CANCELLED":
+            raise APIError(409, "image_cancelled")
+        if code in ("OUT_OF_MEMORY", "INSUFFICIENT_MEMORY"):
+            raise APIError(502, "image_out_of_memory")
+        raise APIError(502, "upstream_request_failed")
+
+
+def image_progress(job):
+    upstream = job.get("progress")
+    if not isinstance(upstream, dict):
+        return {"phase": "queued" if job["state"] == "queued" else "encoding"}
+    progress = {}
+    if upstream.get("phase") in IMAGE_PHASES:
+        progress["phase"] = upstream["phase"]
+    for key in ("step", "totalSteps"):
+        value = upstream.get(key)
+        if type(value) is int and 0 <= value <= 86400:
+            progress[key] = value
+    eta = upstream.get("etaSeconds")
+    if type(eta) in (int, float) and 0 <= eta <= 86400:
+        progress["etaSeconds"] = eta
+    fraction = upstream.get("fraction")
+    if type(fraction) in (int, float) and 0 <= fraction <= 1:
+        progress["fraction"] = fraction
+    return progress
+
+
+def gallery_png(directory, job_id, tokens):
+    """Read only the completed job's first PNG and omit the gallery's embedded recipe."""
+    try:
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            image_fd = os.open(
+                f"{job_id}-00.png", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd,
+            )
+            with os.fdopen(image_fd, "rb") as image:
+                if not stat.S_ISREG(os.fstat(image.fileno()).st_mode):
+                    raise APIError(502, "invalid_upstream_response")
+                body = image.read(MAX_IMAGE + 1)
+        finally:
+            os.close(directory_fd)
+    except (OSError, ValueError):
+        raise APIError(502, "invalid_upstream_response") from None
+    if len(body) > MAX_IMAGE:
+        raise APIError(502, "upstream_response_too_large")
+    if not body.startswith(PNG_SIGNATURE) or any(token.encode("ascii") in body for token in tokens):
+        raise APIError(502, "invalid_upstream_response")
+    view = memoryview(body)
+    position = len(PNG_SIGNATURE)
+    preview = bytearray(PNG_SIGNATURE)
+    while position + 12 <= len(body):
+        end = position + int.from_bytes(view[position:position + 4], "big") + 12
+        if end > len(body):
+            break
+        kind = body[position + 4:position + 8]
+        if kind in {b"IHDR", b"PLTE", b"IDAT", b"tRNS", b"IEND"}:
+            preview.extend(view[position:end])
+        if kind == b"IEND":
+            if any(token.encode("ascii") in preview for token in tokens):
+                break
+            return preview
+        position = end
+    raise APIError(502, "invalid_upstream_response")
 
 
 class ChatTextFilter:
@@ -301,13 +442,9 @@ class WebUIServer(ThreadingMixIn, HTTPServer):
             raise
 
     def process_request_thread(self, request, client_address):
-        deadline = threading.Timer(REQUEST_TIMEOUT, close_socket, args=(request,))
-        deadline.daemon = True
-        deadline.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
-            deadline.cancel()
             self.slots.release()
 
     def handle_error(self, request, client_address):
@@ -331,6 +468,21 @@ class WebUIServer(ThreadingMixIn, HTTPServer):
 
 class WebUIHandler(BaseHTTPRequestHandler):
     timeout = IO_TIMEOUT
+
+    def handle(self):
+        self.connection_deadline = None
+        self.set_connection_deadline(REQUEST_TIMEOUT)
+        try:
+            super().handle()
+        finally:
+            self.connection_deadline.cancel()
+
+    def set_connection_deadline(self, seconds):
+        if self.connection_deadline is not None:
+            self.connection_deadline.cancel()
+        self.connection_deadline = threading.Timer(seconds, close_socket, args=(self.connection,))
+        self.connection_deadline.daemon = True
+        self.connection_deadline.start()
 
     def log_message(self, format, *args):
         pass
@@ -419,7 +571,10 @@ class WebUIHandler(BaseHTTPRequestHandler):
             else:
                 raise APIError(404, "route_not_found")
         except APIError as error:
-            self.send_json(error.status, {"error": error.code})
+            try:
+                self.send_json(error.status, {"error": error.code})
+            except (ConnectionError, TimeoutError):
+                return
         except (ConnectionError, TimeoutError):
             return
 
@@ -445,21 +600,31 @@ class WebUIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "invalid_json")
         return value
 
-    def upstream(self, route, consume, payload=None, *, watch_disconnect=False):
+    def upstream(self, route, consume, payload=None, *, watch_disconnect=False, response_timeout=None):
         config = self.server.config
         url = urlsplit(config.upstream)
         connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
         connection = connection_type(url.hostname, url.port, timeout=IO_TIMEOUT)
         deadline = None
+        expired = threading.Event()
         finished = threading.Event() if watch_disconnect else None
         try:
             connection.connect()
-            deadline = threading.Timer(REQUEST_TIMEOUT, close_socket, args=(connection.sock,))
+            upstream_socket = connection.sock
+
+            def expire():
+                expired.set()
+                close_socket(upstream_socket)
+
+            deadline = threading.Timer(
+                REQUEST_TIMEOUT if response_timeout is None else response_timeout, expire,
+            )
             deadline.daemon = True
             deadline.start()
             if finished is not None:
                 threading.Thread(
-                    target=cancel_on_disconnect, args=(self.connection, connection.sock, finished),
+                    target=cancel_on_disconnect,
+                    args=(self.connection, lambda: close_socket(upstream_socket), finished),
                     daemon=True,
                 ).start()
             headers = {"Authorization": f"Bearer {config.token}"}
@@ -468,6 +633,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 body = json.dumps(payload).encode("utf-8")
                 headers["Content-Type"] = "application/json"
             connection.request("GET" if body is None else "POST", route, body, headers)
+            if response_timeout is not None:
+                upstream_socket.settimeout(response_timeout)
             with connection.getresponse() as response:
                 if response.status in {401, 403}:
                     raise APIError(502, "upstream_authentication_failed")
@@ -481,7 +648,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
         except TimeoutError:
             raise APIError(504, "upstream_timeout") from None
         except (OSError, http.client.HTTPException, ValueError, RecursionError):
+            if expired.is_set():
+                raise APIError(504, "upstream_timeout") from None
             raise APIError(502, "invalid_upstream_response") from None
+        except APIError:
+            if expired.is_set():
+                raise APIError(504, "upstream_timeout") from None
+            raise
         finally:
             if finished is not None:
                 finished.set()
@@ -611,9 +784,93 @@ class WebUIHandler(BaseHTTPRequestHandler):
         if not self.server.image_slots.acquire(blocking=False):
             raise APIError(503, "image_busy")
         try:
-            self.send_image(model, prompt)
+            # Allow time to connect upstream and send the final response to the client.
+            self.set_connection_deadline(IMAGE_TIMEOUT + 2 * IO_TIMEOUT)
+            control_dir = self.server.config.control_data_dir
+            if (control_dir is not None and model is None
+                    and self.headers.get("Accept") == "text/event-stream"):
+                self.stream_image_job(AtomicImageControl(control_dir), prompt)
+            else:
+                self.send_image(model, prompt)
         finally:
             self.server.image_slots.release()
+
+    def stream_image_job(self, control, prompt):
+        deadline = time.monotonic() + IMAGE_TIMEOUT
+        stopped = threading.Event()
+        finished = threading.Event()
+        threading.Thread(
+            target=cancel_on_disconnect, args=(self.connection, stopped.set, finished), daemon=True,
+        ).start()
+        job_route = None
+        terminal = False
+        streaming = False
+        try:
+            defaults = control.call("/capabilities").get("defaults")
+            if not isinstance(defaults, dict) or not all(
+                type(defaults.get(key)) is expected
+                for key, expected in (("width", int), ("height", int), ("steps", int))
+            ) or type(defaults.get("cfgScale")) not in (int, float):
+                raise APIError(502, "invalid_upstream_response")
+            request = {
+                key: defaults[key]
+                for key in ("width", "height", "steps", "cfgScale", "guidance", "samplingMethod", "flowShift")
+                if key in defaults
+            }
+            if stopped.is_set():
+                return
+            job_id = control.call("/jobs", {**request, "prompt": prompt, "batchSize": 1}).get("jobId")
+            if not isinstance(job_id, str) or not IMAGE_JOB_ID.fullmatch(job_id):
+                raise APIError(502, "invalid_upstream_response")
+            job_route = f"/jobs/{job_id}"
+            if stopped.is_set():
+                return
+            self.send_headers(200, "text/event-stream; charset=utf-8")
+            streaming = True
+            self.send_event("progress", {"phase": "queued"})
+            while not stopped.is_set():
+                if time.monotonic() >= deadline:
+                    raise APIError(504, "upstream_timeout")
+                job = control.call(job_route).get("job")
+                if not isinstance(job, dict) or job.get("id") != job_id:
+                    raise APIError(502, "invalid_upstream_response")
+                state = job.get("state")
+                if state in ("failed", "cancelled"):
+                    terminal = True
+                    if state == "cancelled":
+                        raise APIError(409, "image_cancelled")
+                    control.raise_job_error(job.get("error"))
+                if state == "completed":
+                    terminal = True
+                    outputs = job.get("outputs")
+                    output = outputs[0] if isinstance(outputs, list) and outputs else None
+                    path = output.get("path") if isinstance(output, dict) else None
+                    if (not isinstance(path, str) or not os.path.isabs(path)
+                            or os.path.basename(path) != f"{job_id}-00.png"
+                            or output.get("id") != f"{job_id}-00"):
+                        raise APIError(502, "invalid_upstream_response")
+                    image = gallery_png(os.path.dirname(path), job_id, (self.server.config.token, control.token))
+                    for position in range(0, len(image), IMAGE_CHUNK_SIZE):
+                        chunk = base64.b64encode(image[position:position + IMAGE_CHUNK_SIZE]).decode("ascii")
+                        self.send_event("image", {"data": chunk})
+                    self.send_event("done", {})
+                    return
+                if state not in ("queued", "generating"):
+                    raise APIError(502, "invalid_upstream_response")
+                self.send_event("progress", image_progress(job))
+                stopped.wait(IMAGE_POLL_INTERVAL)
+        except APIError as error:
+            if not streaming:
+                raise
+            if not stopped.is_set():
+                self.send_event("error", {"error": error.code})
+        finally:
+            finished.set()
+            if job_route is not None and not terminal:
+                try:
+                    control.call(f"{job_route}/cancel", {})
+                except APIError:
+                    print("Atomic image job cancellation could not be confirmed.", file=sys.stderr)
 
     def send_image(self, model, prompt):
         payload = {"prompt": prompt, "n": 1, "response_format": "b64_json"}
@@ -623,6 +880,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
             "/v1/images/generations",
             lambda response: self.upstream_json(response, MAX_IMAGE),
             payload,
+            response_timeout=IMAGE_TIMEOUT,
+            watch_disconnect=self.headers.get("X-ATC-Cancel-On-Disconnect") == "1",
         )
         images = data.get("data") if isinstance(data, dict) else None
         image = images[0] if isinstance(images, list) and images else None
@@ -635,7 +894,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             raise APIError(502, "invalid_upstream_response") from None
         if self.server.config.token.encode("ascii") in decoded:
             raise APIError(502, "invalid_upstream_response")
-        if decoded.startswith(b"\x89PNG\r\n\x1a\n"):
+        if decoded.startswith(PNG_SIGNATURE):
             media_type = "image/png"
         elif decoded.startswith(b"\xff\xd8\xff"):
             media_type = "image/jpeg"

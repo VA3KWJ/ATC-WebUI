@@ -53,7 +53,7 @@ curl -fsSLo atc-webui-install.sh "https://raw.githubusercontent.com/VA3KWJ/ATC-W
 
 The launcher runs in the foreground. Press Ctrl+C to stop it. To rotate the token, replace the configured token file with the new token, retain ownership and mode `0600`, and restart the WebUI. The empty installation placeholder must be populated before startup.
 
-If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The public API reports image model availability when you submit a prompt. If the model is unavailable, load it in Atomic Server and submit again. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
+If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh chat models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The view shows elapsed time while waiting for the public API and offers a **Stop** button. If the model is unavailable, load it in Atomic Server and submit again. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
 
 Select **Stop** to end a streaming reply. Text already received stays in the conversation, including when the upstream stream is interrupted. Multiple tabs can save turns independently. Reload a tab to see turns saved in another tab. Existing browser history loads automatically.
 
@@ -86,14 +86,25 @@ python3 server.py
 | `ATC_WEBUI_PORT` | `8080` | WebUI listen port. |
 | `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Required for a wildcard bind. Set this when using a reverse proxy. |
 | `ATC_WEBUI_IMAGE_MODEL` | Unset | Use the currently loaded Atomic image model when unset. Set an identifier to request a specific model, or set an empty value to disable image generation. |
+| `ATC_WEBUI_CONTROL_DATA_DIR` | Unset | Absolute Atomic Server data directory on the same machine. Enables live image progress when `ATC_WEBUI_IMAGE_MODEL` is unset. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
+
+### Live image progress
+
+To show sampling steps and Atomic’s time estimate, run the WebUI as the same OS user as Atomic Server and add this setting to the WebUI configuration. Use your actual Atomic data directory if you moved it.
+
+```sh
+ATC_WEBUI_CONTROL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/atomic-chat-cli/data"
+```
+
+Restart the WebUI after updating its settings. The backend uses that directory to find the loopback control listener and its owner-only token. Use a data directory controlled by the Atomic Server account. The backend reads the requested job’s progress and a preview of its completed gallery image. Keep the Atomic control listener bound to loopback. Explicit image model overrides and clients requesting the binary response use the public API. If you use a reverse proxy, disable response buffering for image progress as well as chat.
 
 ## Network access
 
 For remote access, keep the WebUI bound to loopback behind an HTTPS reverse proxy. Require separate access authentication at the proxy. The Atomic API token authenticates only the WebUI's upstream requests.
 
-Set `ATC_WEBUI_PUBLIC_ORIGIN` to the external HTTPS origin and preserve the incoming host. Disable proxy buffering for streamed replies and allow time for the application's request deadline. The WebUI bounds upstream I/O waits to 15 seconds and uses a 180-second connection deadline. It accepts up to 16 concurrent connections, including up to two image generation requests at a time. Additional image requests return HTTP 503 while both image slots are occupied. This example belongs inside an existing Nginx HTTPS server configuration.
+Set `ATC_WEBUI_PUBLIC_ORIGIN` to the external HTTPS origin and preserve the incoming host. Disable proxy buffering for streamed replies. Chat and discovery use 15-second upstream I/O waits and a 180-second client connection deadline. Image generation allows up to 10 minutes for the upstream job and additional time for connection setup and response delivery. Set the reverse proxy's read timeout accordingly, since Atomic returns the image only after generation finishes. The WebUI accepts up to 16 concurrent connections with at most two image requests. Additional image requests return HTTP 503 while both image slots are occupied. This example belongs inside an existing Nginx HTTPS server configuration.
 
 ```nginx
 location / {
@@ -104,7 +115,7 @@ location / {
     proxy_set_header Host $http_host;
     proxy_http_version 1.1;
     proxy_buffering off;
-    proxy_read_timeout 190s;
+    proxy_read_timeout 640s;
 }
 ```
 

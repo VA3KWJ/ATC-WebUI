@@ -30,8 +30,8 @@
       <nav class="history" id="history" aria-label="Conversations"></nav>
       <div class="connection">
         <p id="api-status" role="status">API · Checking…</p>
-        <p id="model-status" role="status">Models · Checking…</p>
-        <button id="refresh" class="secondary" type="button">Refresh models</button>
+        <p id="model-status" role="status">Chat models · Checking…</p>
+        <button id="refresh" class="secondary" type="button">Refresh chat models</button>
       </div>
     </aside>
 
@@ -74,8 +74,13 @@
             <textarea id="image-prompt" rows="4" required placeholder="Describe the image you want…"></textarea>
             <div class="actions">
               <button id="generate" type="submit" disabled>Generate image</button>
+              <button id="stop-image" class="secondary" type="button" hidden>Stop</button>
             </div>
             <p id="image-status" class="feedback" role="status">Checking image settings…</p>
+            <div id="image-progress" class="image-progress" hidden>
+              <progress id="image-progress-bar" aria-label="Image generation progress"></progress>
+              <span id="image-elapsed"></span>
+            </div>
           </form>
           <figure id="preview" class="preview" hidden>
             <img id="generated-image" alt="Generated image">

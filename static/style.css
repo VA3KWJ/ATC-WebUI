@@ -234,6 +234,8 @@ textarea::placeholder { color: var(--muted); }
 
 .gallery { text-decoration: none; display: inline-flex; align-items: center; }
 .image-workspace { display: grid; align-content: start; }
+.image-progress { display: grid; gap: .35rem; color: var(--muted); font-size: .9rem; }
+.image-progress progress { width: 100%; accent-color: var(--accent); }
 .preview {
   margin: .25rem clamp(.85rem, 4vw, 2rem) 1rem;
   padding: 1rem;

@@ -17,9 +17,10 @@ The WebUI targets Atomic Server 0.2.21 with Atomic Core 0.24.8. The installed ve
 
 ## WebUI request behavior
 
-- Browser chat requests send `X-ATC-Cancel-On-Disconnect: 1` to the WebUI. When the browser disconnects, the WebUI closes its upstream connection and releases its request slot. Direct callers use their existing connection behavior by default.
+- Browser chat and image requests send `X-ATC-Cancel-On-Disconnect: 1` to the WebUI. When the browser disconnects, the WebUI closes its upstream connection and releases its request slot. Direct callers use their existing connection behavior by default.
 - An interrupted chat stream emits any safe buffered text before its `stream_interrupted` event. The browser retains the partial reply.
 - The WebUI allows two concurrent image generation requests within its 16-connection limit. When both image slots are occupied, additional image requests receive HTTP `503` with `{"error":"image_busy"}`. Chat can use the other slots.
+- With local image progress enabled and automatic model selection, browser image requests negotiate SSE. The WebUI sends `progress` events with Atomic's phase, sampling steps, completion fraction, and ETA when available. It streams the completed PNG in bounded `image` events and ends with `done` or `error`. Other clients can continue to receive a single binary image from the public API path.
 
 ## Regression verification
 

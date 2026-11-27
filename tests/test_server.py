@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,9 @@ import server
 TOKEN = "mock-secret-2Y5JpHlw"
 MODEL = "/private/atomic/models/example.gguf"
 IMAGE_MODEL = "/private/image-model"
+IMAGE_JOB = "6d5ec10db58f4dcf81906760f2a0654e"
+CONTROL_TOKEN = "mock-control-secret-2Y5JpHlw"
+DIFFUSION = "/atomic/v1/diffusion"
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRuoAAAAASUVORK5CYII="
 )
@@ -40,12 +44,14 @@ class MockHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length)) if length else None
         self.server.calls.put((self.command, self.path, self.headers.get("Authorization"), body))
-        status, headers, chunks = self.server.responses.get(timeout=3)
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name, str(value))
-        self.end_headers()
+        status, headers, chunks, before_headers = self.server.responses.get(timeout=3)
+        if before_headers is not None and not before_headers.wait(4):
+            return
         try:
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, str(value))
+            self.end_headers()
             for chunk in chunks:
                 if isinstance(chunk, threading.Event):
                     if not chunk.wait(4):
@@ -63,12 +69,12 @@ class MockAtomicServer(ThreadingHTTPServer):
         self.responses = queue.Queue()
         super().__init__(("127.0.0.1", 0), MockHandler)
 
-    def enqueue(self, status, payload, **headers):
+    def enqueue(self, status, payload, *, before_headers=None, **headers):
         body = json.dumps(payload).encode()
-        self.responses.put((status, {"Content-Length": len(body), **headers}, [body]))
+        self.responses.put((status, {"Content-Length": len(body), **headers}, [body], before_headers))
 
     def stream(self, *chunks, **headers):
-        self.responses.put((200, {"Content-Type": "text/event-stream", **headers}, chunks))
+        self.responses.put((200, {"Content-Type": "text/event-stream", **headers}, chunks, None))
 
 
 @contextmanager
@@ -104,6 +110,11 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn(TOKEN, repr(config))
         self.assertEqual(config.address, "127.0.0.1")
         self.assertIsNone(config.image_model)
+        self.assertIsNone(config.control_data_dir)
+        with self.assertRaises(server.ConfigurationError):
+            server.Config.from_env(self.env | {
+                "ATC_API_TOKEN": TOKEN, "ATC_WEBUI_CONTROL_DATA_DIR": "relative",
+            })
 
     def test_token_file_must_be_readable_regular_and_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +225,34 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(
             self.upstream.calls.get(timeout=1), (method, route, f"Bearer {TOKEN}", payload),
         )
+
+    @contextmanager
+    def image_control(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            daemon = root / "atc/run/daemon.json"
+            daemon.parent.mkdir(parents=True)
+            daemon.write_text(json.dumps({
+                "state": "ready", "pid": os.getpid(), "control_url": self.ui.config.upstream,
+            }))
+            token = root / "atomic-core/control-token"
+            token.parent.mkdir()
+            token.write_text(CONTROL_TOKEN + "\n")
+            token.chmod(0o600)
+            config = replace(self.ui.config, image_model=None, control_data_dir=root)
+            with patch.object(self.ui, "config", config):
+                yield root
+
+    def enqueue_image_job(self):
+        self.upstream.enqueue(200, {"defaults": {
+            "width": 1024, "height": 1024, "steps": 8, "cfgScale": 1,
+        }})
+        self.upstream.enqueue(200, {"jobId": IMAGE_JOB})
+
+    def expect_control_call(self, method, route, payload=None):
+        self.assertEqual(self.upstream.calls.get(timeout=1), (
+            method, DIFFUSION + route, f"Bearer {CONTROL_TOKEN}", payload,
+        ))
 
     def discover(self):
         self.upstream.enqueue(200, {"data": [
@@ -409,7 +448,7 @@ class WebUITests(unittest.TestCase):
             requests.callback(resume.set)
             images = []
             for _ in range(server.MAX_IMAGE_CLIENTS):
-                self.upstream.responses.put((200, {"Content-Length": len(body)}, [resume, body]))
+                self.upstream.responses.put((200, {"Content-Length": len(body)}, [resume, body], None))
                 connection = http.client.HTTPConnection("127.0.0.1", self.ui.server_port, timeout=3)
                 images.append(connection)
                 requests.callback(connection.close)
@@ -495,7 +534,7 @@ class WebUITests(unittest.TestCase):
     def test_upstream_timeout(self):
         resume = threading.Event()
         self.addCleanup(resume.set)
-        self.upstream.responses.put((200, {"Content-Length": "11"}, [resume, b'{"data":[]}']))
+        self.upstream.responses.put((200, {"Content-Length": "11"}, [resume, b'{"data":[]}'], None))
         with patch.object(server, "IO_TIMEOUT", 0.2):
             with self.response("/api/models") as response:
                 self.assertEqual(response.status, 504)
@@ -503,13 +542,133 @@ class WebUITests(unittest.TestCase):
         resume.set()
         self.expect_call("GET", "/v1/models")
 
+    def test_image_can_wait_longer_than_chat_and_discovery(self):
+        resume = threading.Event()
+        self.upstream.enqueue(200, {
+            "data": [{"b64_json": base64.b64encode(PNG).decode()}],
+        }, before_headers=resume)
+        release = threading.Timer(0.4, resume.set)
+        release.start()
+        try:
+            with (patch.object(server, "IO_TIMEOUT", 0.15),
+                  patch.object(server, "REQUEST_TIMEOUT", 0.25),
+                  patch.object(server, "IMAGE_TIMEOUT", 2)):
+                with self.response("/api/images", {"prompt": "draw"}) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), PNG)
+        finally:
+            release.cancel()
+            resume.set()
+
+    def test_image_deadline_returns_timeout(self):
+        resume = threading.Event()
+        self.upstream.enqueue(200, {}, before_headers=resume)
+        try:
+            with patch.object(server, "IMAGE_TIMEOUT", 0.2):
+                with self.response("/api/images", {"prompt": "draw"}) as response:
+                    self.assertEqual(response.status, 504)
+                    self.assertEqual(json.load(response), {"error": "upstream_timeout"})
+        finally:
+            resume.set()
+
+    def test_control_image_stream_reports_sampling_and_returns_preview(self):
+        with self.image_control() as output:
+            recipe = b"tEXtatomic\0/private/gallery/recipe"
+            chunk = (len(recipe) - 4).to_bytes(4, "big") + recipe + zlib.crc32(recipe).to_bytes(4, "big")
+            (output / f"{IMAGE_JOB}-00.png").write_bytes(PNG[:-12] + chunk + PNG[-12:])
+            self.enqueue_image_job()
+            self.upstream.enqueue(200, {"job": {
+                "id": IMAGE_JOB, "state": "generating", "request": {"prompt": "/private/prompt"},
+                "progress": {"phase": "sampling", "step": 2, "totalSteps": 8,
+                             "fraction": 0.25, "etaSeconds": 23.2, "unexpected": CONTROL_TOKEN},
+            }})
+            self.upstream.enqueue(200, {"job": {
+                "id": IMAGE_JOB, "state": "completed",
+                "outputs": [{"id": f"{IMAGE_JOB}-00", "path": str(output / f"{IMAGE_JOB}-00.png")}],
+            }})
+            with self.response("/api/images", {"prompt": "draw"}, {
+                "Accept": "text/event-stream",
+            }) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+                body = response.read()
+            self.assertNotIn(CONTROL_TOKEN.encode(), body)
+            self.assertNotIn(b"/private/", body)
+            self.assertNotIn(IMAGE_JOB.encode(), body)
+            frames = [(event.removeprefix(b"event: "), json.loads(data.removeprefix(b"data: ")))
+                      for event, data in (frame.splitlines() for frame in body.strip().split(b"\n\n"))]
+            self.assertEqual(frames[1], (b"progress", {
+                "phase": "sampling", "step": 2, "totalSteps": 8, "etaSeconds": 23.2, "fraction": 0.25,
+            }))
+            self.assertEqual(frames[-1], (b"done", {}))
+            self.assertEqual(base64.b64decode(frames[-2][1]["data"]), PNG)
+            self.expect_control_call("GET", "/capabilities")
+            self.expect_control_call("POST", "/jobs", {
+                "width": 1024, "height": 1024, "steps": 8, "cfgScale": 1, "prompt": "draw", "batchSize": 1,
+            })
+            self.expect_control_call("GET", f"/jobs/{IMAGE_JOB}")
+            self.expect_control_call("GET", f"/jobs/{IMAGE_JOB}")
+            self.assertTrue(self.upstream.calls.empty())
+
+    def test_control_image_disconnect_cancels_only_its_own_job(self):
+        resume = threading.Event()
+        with self.image_control():
+            self.enqueue_image_job()
+            self.upstream.enqueue(200, {"job": {"id": IMAGE_JOB, "state": "generating"}},
+                                  before_headers=resume)
+            self.upstream.enqueue(200, {"cancelled": True})
+            try:
+                with self.response("/api/images", {"prompt": "draw"}, {
+                    "Accept": "text/event-stream", "X-ATC-Cancel-On-Disconnect": "1",
+                }) as response:
+                    self.assertEqual(response.readline(), b"event: progress\n")
+                    for _ in range(2):
+                        self.upstream.calls.get(timeout=1)
+                    self.expect_control_call("GET", f"/jobs/{IMAGE_JOB}")
+            finally:
+                resume.set()
+            self.expect_control_call("POST", f"/jobs/{IMAGE_JOB}/cancel", {})
+
+    def test_control_image_rejects_writable_daemon_metadata_before_sending_token(self):
+        with self.image_control() as root:
+            (root / "atc/run/daemon.json").chmod(0o664)
+            with self.response("/api/images", {"prompt": "draw"}, {
+                "Accept": "text/event-stream",
+            }) as response:
+                self.assertEqual(response.status, 502)
+                self.assertEqual(json.load(response), {"error": "image_control_unavailable"})
+            self.assertTrue(self.upstream.calls.empty())
+
+    def test_image_disconnect_releases_slot_before_upstream_responds(self):
+        resume = threading.Event()
+        self.upstream.enqueue(200, {}, before_headers=resume)
+        connection = http.client.HTTPConnection("127.0.0.1", self.ui.server_port, timeout=2)
+        try:
+            connection.request("POST", "/api/images", '{"prompt":"draw"}', {
+                "Content-Type": "application/json", "X-ATC-Cancel-On-Disconnect": "1",
+            })
+            self.expect_call("POST", "/v1/images/generations", {
+                "model": IMAGE_MODEL, "prompt": "draw", "n": 1, "response_format": "b64_json",
+            })
+            connection.close()
+
+            self.assertTrue(self.ui.image_slots.acquire(timeout=1))
+            try:
+                self.assertTrue(self.ui.image_slots.acquire(timeout=1))
+                self.ui.image_slots.release()
+            finally:
+                self.ui.image_slots.release()
+        finally:
+            connection.close()
+            resume.set()
+
     def test_caps_concurrent_requests(self):
         resume = threading.Event()
         self.addCleanup(resume.set)
         connections = []
         try:
             for _ in range(3):
-                self.upstream.responses.put((200, {"Content-Length": "11"}, [resume, b'{"data":[]}']))
+                self.upstream.responses.put((200, {"Content-Length": "11"}, [resume, b'{"data":[]}'], None))
                 connection = http.client.HTTPConnection("127.0.0.1", self.ui.server_port, timeout=2)
                 connections.append(connection)
                 connection.request("GET", "/api/models")
