@@ -26,8 +26,73 @@ as_root() {
     elif command -v doas >/dev/null 2>&1; then
         doas "$@"
     else
-        fail "Install Python 3.10+, curl, and CA certificates with your package manager, then rerun this installer."
+        fail "This installer needs root, sudo, or doas to run: $1"
     fi
+}
+
+system_command() {
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v "$1"
+}
+
+select_service_manager() {
+    service_manager=
+    pid_one=$(cat /proc/1/comm 2>/dev/null) || pid_one=
+    if [ "$pid_one" = systemd ] && [ -d /run/systemd/system ]; then
+        systemctl_path=$(system_command systemctl) || fail "systemctl is required to install the service."
+        service_manager=systemd
+    elif [ -f /run/openrc/softlevel ]; then
+        system_command rc-service >/dev/null && system_command supervise-daemon >/dev/null ||
+            fail "rc-service and supervise-daemon are required to install the OpenRC service."
+        service_manager=openrc
+    elif [ "$pid_one" = init ] && { [ -p /run/initctl ] || [ -p /dev/initctl ]; }; then
+        system_command start-stop-daemon >/dev/null && system_command update-rc.d >/dev/null &&
+            system_command flock >/dev/null ||
+            fail "Debian-style start-stop-daemon, update-rc.d, and flock are required to install the SysVinit service."
+        service_manager=sysv
+    fi
+}
+
+register_service() {
+    case "$service_manager" in
+        systemd) destination=/etc/systemd/system/atc-webui.service; mode=0644 ;;
+        openrc|sysv) destination=/etc/init.d/atc-webui; mode=0755 ;;
+        *)
+            printf '%s\n' "No supported init system is active. Use the foreground launcher."
+            return
+            ;;
+    esac
+
+    as_root /bin/sh -eu -c '
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin
+        staged=$(mktemp "${2}.XXXXXX")
+        trap '\''rm -f -- "$staged"'\'' EXIT
+        trap '\''exit 1'\'' HUP INT TERM
+        cat -- "$1" > "$staged"
+        chmod "$3" "$staged"
+        mv -fT -- "$staged" "$2"
+    ' sh "$work/service" "$destination" "$mode" ||
+        fail "Could not install the service definition at $destination."
+
+    if [ "$service_manager" = systemd ]; then
+        as_root "$systemctl_path" daemon-reload || fail "Installed $destination, but systemd could not reload it."
+    fi
+    prefix=
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then prefix='sudo '; else prefix='doas '; fi
+    fi
+    printf 'Installed service definition: %s\n' "$destination"
+    printf '%s\n' "After configuring Atomic WebUI, enable it at boot and start it:"
+    case "$service_manager" in
+        systemd)
+            printf '  %ssystemctl enable --now atc-webui\n  %ssystemctl status atc-webui\n  %ssystemctl restart atc-webui\n' "$prefix" "$prefix" "$prefix"
+            ;;
+        openrc)
+            printf '  %src-update add atc-webui default\n  %src-service atc-webui start\n  %src-service atc-webui status\n  %src-service atc-webui restart\n' "$prefix" "$prefix" "$prefix" "$prefix"
+            ;;
+        sysv)
+            printf '  %supdate-rc.d atc-webui defaults\n  %supdate-rc.d atc-webui enable\n  %sservice atc-webui start\n  %sservice atc-webui status\n  %sservice atc-webui restart\n' "$prefix" "$prefix" "$prefix" "$prefix" "$prefix"
+            ;;
+    esac
 }
 
 install_prerequisites() {
@@ -81,6 +146,7 @@ main() {
         [ -z "$family" ] || break
     done
     [ -n "$family" ] || fail "Unsupported distribution: ${PRETTY_NAME:-${ID:-unknown}}. See the README for manual installation."
+    select_service_manager
 
     ref=${ATC_WEBUI_REF:-main}
     case "$ref" in
@@ -103,8 +169,9 @@ main() {
         --location --connect-timeout 10 --max-time 120 --max-filesize 10485760 \
         "https://codeload.github.com/VA3KWJ/ATC-WebUI/tar.gz/$ref" -o "$work/source.tar.gz"
 
-    "$python" - "$work/source.tar.gz" "$python" <<'PY'
+    "$python" - "$work/source.tar.gz" "$python" "$service_manager" "$work/service" <<'PY'
 import os
+import pwd
 import shlex
 import stat
 import sys
@@ -173,7 +240,144 @@ def xdg_path(variable, default):
     return path.resolve() / "atc-webui"
 
 
-def install(archive_path, python):
+def systemd_quote(value):
+    value = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{value}"'
+
+
+def service_definition(manager, data):
+    account = pwd.getpwuid(os.geteuid())
+    home = str(Path.home())
+    launcher = str(data / "run")
+    environment = {"HOME": home}
+    for variable in ("XDG_DATA_HOME", "XDG_CONFIG_HOME"):
+        if os.environ.get(variable):
+            environment[variable] = str(xdg_path(variable, "").parent)
+    paths = (*environment.values(), launcher)
+    if any(ord(char) < 32 or ord(char) == 127 for path in paths for char in path):
+        raise ValueError("Service paths cannot contain control characters")
+
+    if manager == "systemd":
+        env_lines = "".join(
+            f"Environment={systemd_quote(f'{name}={value}')}\n"
+            for name, value in environment.items()
+        )
+        exec_path = systemd_quote(launcher.replace("$", "$$"))
+        return (
+            "[Unit]\nDescription=Atomic WebUI\nAfter=network.target\n\n"
+            f"[Service]\nUser={account.pw_uid}\nUMask=0077\n"
+            f"{env_lines}ExecStart=/bin/sh {exec_path}\nRestart=on-failure\nRestartSec=5s\n\n"
+            "[Install]\nWantedBy=multi-user.target\n"
+        )
+
+    if manager == "openrc":
+        # OpenRC evaluates command_args as shell words when starting the daemon.
+        args = shlex.join([*(f"{name}={value}" for name, value in environment.items()), "/bin/sh", launcher])
+        return (
+            "#!/sbin/openrc-run\n"
+            "description='Atomic WebUI'\nsupervisor=supervise-daemon\n"
+            f"command=/usr/bin/env\ncommand_user={shlex.quote(shlex.quote(account.pw_name))}\n"
+            f"command_args={shlex.quote(args)}\numask=0077\n"
+            "respawn_delay=5\nrespawn_max=5\nrespawn_period=60\n"
+            "depend() { use net; }\n"
+        )
+
+    exports = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in environment.items())
+    return f"""#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          atc-webui
+# Required-Start:    $local_fs $remote_fs $network
+# Required-Stop:     $local_fs $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Atomic WebUI
+### END INIT INFO
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+{exports}launcher={shlex.quote(launcher)}
+server={shlex.quote(str(data / 'server.py'))}
+uid={account.pw_uid}
+pidfile=/run/atc-webui.pid
+identity=/run/atc-webui.identity
+
+process_start_time() {{
+    read -r proc_stat < "/proc/$1/stat" || return 1
+    # The comm field can contain spaces and parentheses. The start time is
+    # field 22, or field 20 after removing the PID and comm.
+    set -f
+    set -- ${{proc_stat##*) }}
+    set +f
+    case "${{1:-}}" in ''|Z|X) return 1 ;; esac
+    [ "$#" -ge 20 ] || return 1
+    shift 19
+    printf '%s\\n' "$1"
+}}
+
+read_pid() {{
+    read -r pid < "$pidfile" || return 1
+    case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+}}
+
+running_pid() {{
+    [ -f "$pidfile" ] && [ -f "$identity" ] && read_pid || return 1
+    {{
+        read -r started_pid && read -r started_uid && read -r started_time
+    }} < "$identity" || return 1
+    [ "$pid" = "$started_pid" ] &&
+        [ "$(process_start_time "$pid" 2>/dev/null)" = "$started_time" ] &&
+        start-stop-daemon --status --pid "$pid" --user "$started_uid"
+}}
+
+start() {{
+    if running_pid; then return 0; fi
+    rm -f -- "$pidfile" "$identity" || return
+    start-stop-daemon --start --background --make-pidfile --pidfile "$pidfile" \\
+        --chuid "$uid" --startas /bin/sh -- "$launcher" 9>&- || return
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.1
+        if [ -f "$pidfile" ] && read_pid &&
+            started_time=$(process_start_time "$pid" 2>/dev/null) &&
+            start-stop-daemon --status --pid "$pid" --user "$uid" &&
+            grep -Fzxq -- "$server" "/proc/$pid/cmdline" 2>/dev/null; then
+            printf '%s\\n' "$pid" "$uid" "$started_time" > "$identity"
+            return
+        fi
+    done
+    printf '%s\\n' 'Atomic WebUI did not start. Check the configuration with the foreground launcher.' >&2
+    return 1
+}}
+
+stop() {{
+    if running_pid; then
+        start-stop-daemon --stop --oknodo --retry TERM/10/KILL/5 \\
+            --pid "$pid" --user "$started_uid" || return
+    fi
+    rm -f -- "$pidfile" "$identity"
+}}
+
+case "${{1:-}}" in
+    start|stop|restart|force-reload|status) ;;
+    *) printf 'Usage: %s {{start|stop|restart|force-reload|status}}\\n' "$0" >&2; exit 2 ;;
+esac
+exec 9>/run/atc-webui.lock || exit 1
+flock -x 9 || exit 1
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart|force-reload) stop && start ;;
+    status)
+        if running_pid; then
+            printf 'Atomic WebUI is running (PID %s).\\n' "$pid"
+        else
+            printf '%s\\n' 'Atomic WebUI is stopped.'
+            exit 3
+        fi
+        ;;
+esac
+"""
+
+
+def install(archive_path, python, manager, service_path):
     python = os.path.abspath(python)
     if Path(archive_path).stat().st_size > 10 * 1024 * 1024:
         raise ValueError("Source archive exceeds 10 MiB")
@@ -193,6 +397,8 @@ def install(archive_path, python):
     config = xdg_path("XDG_CONFIG_HOME", ".config")
     if data == config or data in config.parents or config in data.parents:
         raise ValueError("The installation and configuration directories must be separate")
+    if manager:
+        Path(service_path).write_text(service_definition(manager, data), encoding="utf-8")
     check_ancestors(data)
     check_ancestors(config)
     for directory in (data, data / "static", config):
@@ -220,7 +426,7 @@ def install(archive_path, python):
     print(f"Configuration: {settings}")
     print(f"API token file: {token} (mode 0600)")
     print("Set ATC_API_URL and put your Atomic public API client token in the token file.")
-    print(f"Start Atomic WebUI with: {shlex.quote(str(data / 'run'))}")
+    print(f"Foreground launcher: {shlex.quote(str(data / 'run'))}")
 
 
 try:
@@ -228,6 +434,7 @@ try:
 except (OSError, KeyError, ValueError, tarfile.TarError) as error:
     sys.exit(f"Installation failed: {error}")
 PY
+    register_service
 }
 
 main "$@"

@@ -36,7 +36,9 @@ The script supports Debian and Ubuntu, Fedora, RHEL and compatible distributions
 | `~/.config/atc-webui/config.sh` | Per-user settings |
 | `~/.config/atc-webui/api-token` | Empty token file on first install, owned by the current user with mode `0600` |
 
-The installer honors absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` values and prints the resulting paths. Use directories controlled by the installer account or root. Rerunning it updates the application and launcher and preserves the contents of the settings and token files. It leaves startup to the operator after configuration.
+The installer honors absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` values and prints the resulting paths. Use directories controlled by the installer account or root. Rerunning it updates the application and launcher and preserves the contents of the settings and token files.
+
+On systemd, OpenRC, and Debian-style SysVinit systems, the installer registers a boot service named `atc-webui`. Run the installer as the account that should run the WebUI. Registration uses root, `sudo`, or `doas`. Enable and start the service after configuring it. A reinstall preserves boot enablement and leaves a running service in place until you restart it. Hosts without an active supported init system can use the foreground launcher.
 
 To pin both the script and the application archive to a published commit, set `ref` to the full commit SHA.
 
@@ -49,13 +51,17 @@ curl -fsSLo atc-webui-install.sh "https://raw.githubusercontent.com/VA3KWJ/ATC-W
 
 1. Run `atc api status` on the Atomic Server host to find its public API origin. Edit `~/.config/atc-webui/config.sh` and set `ATC_API_URL` to that origin, for example `http://127.0.0.1:1339`. Use HTTPS for a network upstream.
 2. Put an Atomic **public API client token** in `~/.config/atc-webui/api-token`. Keep only the token on one line and keep the file owned by the account running the WebUI with mode `0600`. If `ATC_API_TOKEN` is already exported in the shell, unset it when using the token file.
-3. Start the WebUI and open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+3. Enable and start the WebUI using the commands for your init system, then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
 
-   ```sh
-   ~/.local/share/atc-webui/run
-   ```
+Run these service commands as root or prefix them with `sudo` or `doas` as appropriate.
 
-The launcher runs in the foreground. Press Ctrl+C to stop it. To rotate the token, replace the configured token file with the new token, retain ownership and mode `0600`, and restart the WebUI. The empty installation placeholder must be populated before startup.
+| Init system | Enable and start | Check status | Restart |
+| --- | --- | --- | --- |
+| systemd | `systemctl enable --now atc-webui` | `systemctl status atc-webui` | `systemctl restart atc-webui` |
+| OpenRC (Alpine) | `rc-update add atc-webui default`, then `rc-service atc-webui start` | `rc-service atc-webui status` | `rc-service atc-webui restart` |
+| SysVinit (Debian-style) | `update-rc.d atc-webui defaults`, then `update-rc.d atc-webui enable` and `service atc-webui start` | `service atc-webui status` | `service atc-webui restart` |
+
+For a foreground run, use the launcher path printed by the installer, typically `~/.local/share/atc-webui/run`. Press Ctrl+C to stop it. To rotate the token, replace the configured token file with the new token, retain ownership and mode `0600`, and restart the WebUI. The empty installation placeholder must be populated before startup.
 
 If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh chat models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The view shows elapsed time while waiting for the public API and offers a **Stop** button. If the model is unavailable, load it in Atomic Server and submit again. A generated image preview lasts for the current page session. Click the preview to open the original image in a new tab or choose **Download image** to save it. Conversations and theme choices are stored in the current browser.
 
@@ -100,7 +106,7 @@ python3 server.py
 
 ### Local image model status and progress
 
-Run the WebUI on the same machine and as the same OS user as Atomic Server. For a launcher installation, add this line to `~/.config/atc-webui/config.sh`, or use the corresponding file under `$XDG_CONFIG_HOME`. For a manual launch or service, set the variable in the environment that starts `server.py`.
+Run the WebUI on the same machine and as the same OS user as Atomic Server. For an installer-managed service or foreground launcher, add this line to `~/.config/atc-webui/config.sh`, or use the corresponding file under `$XDG_CONFIG_HOME`. For a manual launch from a checkout, set the variable in the environment that starts `server.py`.
 
 ```sh
 ATC_WEBUI_CONTROL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/atomic-chat-cli/data"
@@ -158,7 +164,7 @@ location / {
 }
 ```
 
-For direct access on a trusted LAN, add both settings to `~/.config/atc-webui/config.sh` and restart the launcher. Replace `192.168.1.10` with the WebUI machine's LAN address and use the configured listen port in the URL.
+For direct access on a trusted LAN, add both settings to `~/.config/atc-webui/config.sh` and restart the WebUI. Replace `192.168.1.10` with the WebUI machine's LAN address and use the configured listen port in the URL.
 
 ```sh
 ATC_WEBUI_HOST="0.0.0.0"
