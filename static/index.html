@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Atomic WebUI</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true">A</span>
+      <span>Atomic <span class="muted">WebUI</span></span>
+    </a>
+    <button id="theme" type="button" class="secondary">Switch theme</button>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar" aria-label="Workspace">
+      <div class="navigation">
+        <button id="chat-view" type="button" aria-pressed="true">Chat</button>
+        <button id="image-view" type="button" aria-pressed="false">Images</button>
+      </div>
+      <div class="history-heading">
+        <h2>Conversations</h2>
+        <button id="new-chat" type="button" aria-label="New conversation" title="New conversation">+</button>
+      </div>
+      <nav class="history" id="history" aria-label="Conversations"></nav>
+      <div class="connection">
+        <p id="api-status" role="status">API · Checking…</p>
+        <p id="model-status" role="status">Models · Checking…</p>
+        <button id="refresh" class="secondary" type="button">Refresh models</button>
+      </div>
+    </aside>
+
+    <main>
+      <section id="chat" class="panel" aria-labelledby="chat-title">
+        <header class="panel-heading">
+          <h1 id="chat-title">Chat</h1>
+          <div class="model-control">
+            <label for="model">Model</label>
+            <select id="model" disabled><option>No models</option></select>
+          </div>
+        </header>
+
+        <div id="messages" class="messages" role="region" aria-label="Conversation" tabindex="0"></div>
+        <div id="welcome" class="welcome">
+          <span class="brand-mark" aria-hidden="true">A</span>
+          <h2>Start a conversation</h2>
+          <p class="muted">Choose a model and send a message.</p>
+        </div>
+
+        <form id="chat-form" class="composer">
+          <label for="chat-prompt">Message</label>
+          <textarea id="chat-prompt" rows="3" required placeholder="Write a message…"></textarea>
+          <div class="actions">
+            <button id="send" type="submit" disabled>Send message</button>
+            <button id="stop" class="secondary" type="button" hidden>Stop</button>
+          </div>
+          <p id="chat-status" class="feedback" role="status"></p>
+        </form>
+      </section>
+
+      <section id="images" class="panel" aria-labelledby="image-title" hidden>
+        <header class="panel-heading">
+          <h1 id="image-title">Images</h1>
+          <a id="gallery" class="secondary gallery" target="_blank" rel="noopener noreferrer" hidden>Open gallery ↗</a>
+        </header>
+        <div class="image-workspace">
+          <form id="image-form" class="composer">
+            <label for="image-prompt">Image prompt</label>
+            <textarea id="image-prompt" rows="4" required placeholder="Describe the image you want…"></textarea>
+            <div class="actions">
+              <button id="generate" type="submit" disabled>Generate image</button>
+            </div>
+            <p id="image-status" class="feedback" role="status">Checking image availability…</p>
+          </form>
+          <figure id="preview" class="preview" hidden>
+            <img id="generated-image" alt="Generated image">
+            <figcaption id="image-caption"></figcaption>
+          </figure>
+        </div>
+      </section>
+      <p id="storage-status" class="storage-status" role="status"></p>
+    </main>
+  </div>
+</body>
+</html>

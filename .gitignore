@@ -25,5 +25,8 @@ images/
 # OS files
 .DS_Store
 
+# Local implementation plan
+/Plan/
+
 # Codex
 .codex/
