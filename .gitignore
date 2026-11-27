@@ -30,3 +30,6 @@ images/
 
 # Codex
 .codex/
+
+# Local testing
+update-local.sh

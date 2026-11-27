@@ -381,3 +381,20 @@ textarea::placeholder { color: var(--muted); }
 @media (max-width: 61rem) {
   .model-management { grid-template-columns: minmax(0, 1fr); }
 }
+
+.model-management .loaded-models {
+  display: grid;
+  gap: .45rem;
+  padding: 0;
+  list-style: none;
+}
+
+.loaded-models li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .45rem .65rem;
+}
+
+.model-management .loaded-models li + li { margin-top: 0; }

@@ -785,6 +785,12 @@ const modelManagement = {
   atomicLoadBusy: false,
   startingLoad: false,
   lastDownloads: null,
+  installed: [],
+  loaded: [],
+  loadedAvailable: {},
+  changingModel: false,
+  refreshStatus: false,
+  inventoryVersion: 0,
   refreshChat: false,
 };
 
@@ -797,6 +803,8 @@ const modelControlErrors = {
   model_control_busy: "Model controls are busy. Try again shortly.",
   model_control_stale: "This selection has expired or is unavailable. Refresh the list and try again.",
   model_control_provider: "That engine is unavailable on this host.",
+  model_control_state_unknown: "Atomic could not confirm whether this model is loaded. Try again after status is available.",
+  model_control_still_loaded: "Unload this model before deleting its download.",
   model_control_timeout: "Atomic did not respond in time. Check its status before trying again.",
 };
 Object.assign(errors, modelControlErrors);
@@ -927,21 +935,108 @@ async function startModelDownload() {
   }
 }
 
+function selectedInstalledModel() {
+  return modelManagement.installed.find((model) => model.id === elements["installed-model"].value);
+}
+
+function isInstalledModelLoaded(model, sameProvider = false) {
+  return modelManagement.loaded.some((loaded) => loaded.key === model.loaded_key
+    && (!sameProvider || loaded.provider === model.provider));
+}
+
 function updateLoadButton() {
-  elements["load-model"].disabled = !elements["installed-model"].value
-    || modelManagement.startingLoad || modelManagement.atomicLoadBusy || modelManagement.load?.status === "loading";
+  const selected = selectedInstalledModel();
+  const busy = modelManagement.changingModel || modelManagement.startingLoad
+    || modelManagement.atomicLoadBusy || modelManagement.load?.status === "loading";
+  const loaded = selected && isInstalledModelLoaded(selected);
+  elements["load-model"].disabled = !selected || selected.loadable === false || busy
+    || isInstalledModelLoaded(selected, true);
+  elements["delete-model"].hidden = !selected?.delete_id;
+  elements["delete-model"].disabled = !selected?.delete_id || busy || loaded
+    || !modelManagement.loadedAvailable[selected?.category];
+  for (const button of elements["loaded-models"].querySelectorAll("button")) button.disabled = Boolean(busy);
+}
+
+function renderInstalledModels() {
+  fillModelSelect(elements["installed-model"], modelManagement.installed.map((model) => ({
+    id: model.id,
+    label: model.label + " · " + model.provider + (isInstalledModelLoaded(model) ? " · Loaded" : ""),
+  })), "No installed models");
+  updateLoadButton();
+}
+
+function renderLoadedModels(loaded = [], available = {}) {
+  if (JSON.stringify([loaded, available]) === JSON.stringify([modelManagement.loaded, modelManagement.loadedAvailable])) {
+    return;
+  }
+  const focused = elements["loaded-models"].contains(document.activeElement) ? document.activeElement : null;
+  const focusedId = focused?.dataset.modelId;
+  modelManagement.loaded = loaded;
+  modelManagement.loadedAvailable = available;
+  const rows = loaded.map((model) => {
+    const row = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = model.label + " · " + model.provider;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = "Unload";
+    button.dataset.modelId = model.id;
+    button.setAttribute("aria-label", "Unload " + label.textContent);
+    button.addEventListener("click", () => changeModel("unload", model.id, model.label));
+    row.append(label, button);
+    return row;
+  });
+  elements["loaded-models"].replaceChildren(...rows);
+  const missing = [["text", "Chat"], ["image", "Images"]]
+    .filter(([category]) => !available[category]).map(([, label]) => label);
+  const message = missing.length ? "Loaded status unavailable for " + missing.join(" and ") + "."
+    : loaded.length ? "" : "No chat or image models loaded.";
+  feedback("loaded-model-status", message);
+  renderInstalledModels();
+  if (focusedId) {
+    const next = rows.find((row) => row.lastChild.dataset.modelId === focusedId);
+    (next?.lastChild ?? elements["refresh-installed"]).focus();
+  }
 }
 
 async function refreshInstalledModels() {
+  const version = ++modelManagement.inventoryVersion;
   try {
     const { models } = await controlRequest("installed");
-    fillModelSelect(elements["installed-model"], models.map((model) => ({
-      id: model.id, label: model.label + " · " + model.provider,
-    })), "No installed models");
+    if (version !== modelManagement.inventoryVersion) return;
+    modelManagement.installed = models;
+    renderInstalledModels();
   } catch (error) {
-    feedback("load-model-status", error.message, "error");
+    if (version === modelManagement.inventoryVersion) feedback("load-model-status", error.message, "error");
+  }
+}
+
+async function changeModel(action, id, label) {
+  if (modelManagement.changingModel) return;
+  const deleting = action === "delete";
+  if (deleting && !window.confirm("Permanently delete the download for " + label + "?")) return;
+  const status = deleting ? "load-model-status" : "unload-model-status";
+  modelManagement.changingModel = true;
+  updateLoadButton();
+  feedback(status, deleting ? "Deleting model…" : "Unloading model…");
+  try {
+    const { category } = await controlRequest(action, { id });
+    feedback(status, label + (deleting ? " deleted." : " unloaded."), "available");
+    if (category === "text") {
+      modelManagement.refreshChat = true;
+      refreshChatAfterLoad();
+    } else {
+      refreshImageModel();
+    }
+    await refreshInstalledModels();
+  } catch (error) {
+    feedback(status, error.message, "error");
   } finally {
+    modelManagement.changingModel = false;
     updateLoadButton();
+    if (modelManagement.polling) modelManagement.refreshStatus = true;
+    else pollModelJobs();
   }
 }
 
@@ -971,7 +1066,8 @@ async function pollModelJobs() {
   clearTimeout(modelManagement.pollTimer);
   modelManagement.polling = true;
   try {
-    const { downloads, loads } = await controlRequest("status");
+    const { downloads, loads, loaded, loaded_available: available } = await controlRequest("status");
+    renderLoadedModels(loaded, available);
     modelManagement.atomicLoadBusy = loads.some((entry) => entry.status === "loading");
     const load = modelManagement.loadTicket
       ? loads.find((entry) => entry.id === modelManagement.loadTicket) : loads[0];
@@ -995,7 +1091,7 @@ async function pollModelJobs() {
       const previous = modelManagement.load;
       modelManagement.load = load;
       if (load.status === "loading") feedback("load-model-status", "Loading " + load.label + "…");
-      if (load.status === "failed") {
+      if (load.status === "failed" && (previous?.id !== load.id || previous.status !== "failed")) {
         modelManagement.loadTicket = null;
         feedback("load-model-status", describeError(load.error, "Model load failed."), "error");
       }
@@ -1011,11 +1107,15 @@ async function pollModelJobs() {
       }
     }
   } catch (error) {
+    renderLoadedModels();
+    feedback("loaded-model-status", "Loaded model status unavailable.", "error");
     feedback("model-jobs-status", error.message, "error");
   } finally {
     modelManagement.polling = false;
     updateLoadButton();
-    if (shouldPoll()) modelManagement.pollTimer = setTimeout(pollModelJobs, 3000);
+    const delay = modelManagement.refreshStatus ? 0 : 3000;
+    modelManagement.refreshStatus = false;
+    if (shouldPoll()) modelManagement.pollTimer = setTimeout(pollModelJobs, delay);
   }
 }
 
@@ -1054,6 +1154,12 @@ elements["review-download"].addEventListener("click", reviewModelDownload);
 elements["start-download"].addEventListener("click", startModelDownload);
 elements["installed-model"].addEventListener("change", updateLoadButton);
 elements["load-model"].addEventListener("click", startModelLoad);
+elements["delete-model"].addEventListener("click", () => {
+  const model = selectedInstalledModel();
+  if (!elements["delete-model"].disabled && model?.delete_id) {
+    changeModel("delete", model.delete_id, model.label);
+  }
+});
 elements["refresh-installed"].addEventListener("click", refreshInstalledModels);
 elements["new-chat"].addEventListener("click", () => {
   state.activeId = null;

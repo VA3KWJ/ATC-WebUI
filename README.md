@@ -133,7 +133,7 @@ Hover over a gallery image or focus it with the keyboard to reveal **Save** and 
 ## Manage local models
 
 > [!WARNING]
-> **Model controls currently have no WebUI authentication.** Anyone who can reach an enabled instance on the LAN can start multi-gigabyte downloads, consume disk space and bandwidth, and load models that may displace running models or interrupt inference. The Atomic API token authenticates WebUI requests to Atomic Server. **Enable model controls only on a trusted private network and keep the WebUI off the public internet.** WebUI authentication is planned for a later release.
+> **Model controls currently have no WebUI authentication.** Anyone who can reach an enabled instance on the LAN can start multi-gigabyte downloads, load or unload models and interrupt inference, or permanently delete completed model downloads. The Atomic API token authenticates WebUI requests to Atomic Server. **Enable model controls only on a trusted private network and keep the WebUI off the public internet.** WebUI authentication is planned for a later release.
 
 Run WebUI and Atomic Server under the same account. Use Atomic Server 0.2.21, keep `ATC_API_URL` on loopback, and set `ATC_WEBUI_MODEL_CONTROL=1` in the launcher configuration or environment. For LAN access, configure the WebUI host and public origin as shown below. Model controls accept direct connections from private IPv4 and unique-local IPv6 addresses when the WebUI is bound for network access.
 
@@ -144,6 +144,8 @@ Use the loopback URL for `ATC_API_URL` even if Atomic reports a wildcard bind. F
 In **Models**, browse the Atomic catalog or search by name or Hugging Face repository ID. Chat search offers GGUF and the MLX or managed safetensors engines reported for the host. Image search covers Atomic catalog variants. Choose a variant, review its size and compatibility, then select **Download**. Atomic owns the job, and the **Downloads** list can show its progress after a page reload. Retrying the same confirmation after a request error reuses its request ID. Use Atomic Server's native controls to resume a job that reports a failed or interrupted state.
 
 After downloading, choose a model under **Installed models** and select **Load model**. Loading may replace a model on the same device. Chat refreshes its available models after a successful load. Images uses the active Atomic image model unless `ATC_WEBUI_IMAGE_MODEL` specifies a model.
+
+**Loaded models** shows the chat and image models currently running in Atomic, including models loaded from the CLI. Select **Unload** to free memory. To permanently remove a completed download, unload the model first, choose it under **Installed models**, and confirm **Delete model**. Atomic handles file removal. Gallery images stay in the gallery. Avoid switching models in another Atomic client while unloading or deleting in the WebUI.
 
 Model selectors use the full width of their sections. The Models view uses two columns on wider screens and stacks the sections on narrower screens.
 

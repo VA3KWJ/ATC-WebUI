@@ -135,14 +135,21 @@
           </div>
           <div class="composer">
             <h2>Installed models</h2>
-            <label for="installed-model">Model to load</label>
+            <label for="installed-model">Model</label>
             <select id="installed-model" disabled></select>
             <div class="actions">
               <button id="load-model" type="button" aria-describedby="load-model-note" disabled>Load model</button>
+              <button id="delete-model" type="button" class="secondary" disabled hidden>Delete model</button>
               <button id="refresh-installed" type="button" class="secondary">Refresh installed models</button>
             </div>
             <p id="load-model-note" class="muted">Loading can replace a model on the same device.</p>
             <p id="load-model-status" class="feedback" role="status"></p>
+          </div>
+          <div class="composer">
+            <h2>Loaded models</h2>
+            <ul id="loaded-models" class="loaded-models"></ul>
+            <p id="loaded-model-status" class="feedback" role="status"></p>
+            <p id="unload-model-status" class="feedback" role="status"></p>
           </div>
           <div class="composer">
             <h2>Downloads</h2>

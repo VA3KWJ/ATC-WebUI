@@ -21,6 +21,7 @@ class ModelControlTests(unittest.TestCase):
             "artifacts.list": [],
             "setup.status": {"setups": []},
             "managed.list": [],
+            "media.status": {"model": {"state": "unloaded"}},
         }
         self.control.call = Mock(side_effect=lambda name, *args, **kwargs: self.replies[name])
 
@@ -153,6 +154,7 @@ class ModelControlTests(unittest.TestCase):
         self.assertEqual(self.control.status({})["loads"][0]["status"], "failed")
 
     def test_status_uses_durable_jobs_and_native_task_progress(self):
+        self.replies["models.installed"] = [{"id": "owner/chat", "provider": "llamacpp"}]
         self.replies["setup.status"]["setups"] = [{
             "setup_id": "setup", "task_ids": {"model": "task"}, "stage": "downloading",
             "plan": {"model_id": "owner/chat", "total_download_bytes": 20},
@@ -165,6 +167,8 @@ class ModelControlTests(unittest.TestCase):
         ])
         self.replies["setup.status"]["setups"][0]["stage"] = "ready"
         self.assertEqual(self.control.status({})["downloads"][0]["bytes"], 20)
+        self.replies["models.installed"].clear()
+        self.assertEqual(self.control.status({})["downloads"], [])
 
     def test_instance_verification_fails_closed(self):
         status = {"running": True, "api": {"running": True, "host": "127.0.0.1", "port": 1338}}
@@ -201,3 +205,126 @@ class ModelControlTests(unittest.TestCase):
             with self.assertRaises(ControlError) as error:
                 self.control.verify_instance()
             self.assertEqual(error.exception.code, "model_control_stopped")
+
+    def test_live_loaded_sessions_and_image_unload_use_exact_identity(self):
+        instance = {"sessions": [
+            {"provider": "llamacpp-upstream", "model_id": "/private/chat.gguf"},
+            {"provider": "strata", "model_id": "owner/native"},
+        ]}
+        self.replies["media.status"] = {"model": {"state": "loaded", "loaded": {
+            "modality": "image", "modelId": "image:first", "displayName": "First image",
+        }}}
+        self.replies["models.unload"] = {"success": True}
+        self.replies["media.unload"] = {}
+        with patch.object(self.control, "verify_instance", return_value=instance):
+            status = self.control.status(instance)
+            self.assertEqual(status["loaded_available"], {"text": True, "image": True})
+            self.assertNotIn("/private", json.dumps(status))
+            self.assertEqual(len(status["loaded"]), 3)
+            chat, _, image = status["loaded"]
+            self.assertEqual(self.control.unload(chat), {"category": "text"})
+            self.control.call.assert_called_with(
+                "models.unload", {"provider": "llamacpp-upstream", "model_id": "/private/chat.gguf"},
+            )
+            self.replies["models.unload"] = {"success": False, "error": "/private/process"}
+            with self.assertRaises(ControlError) as failed:
+                self.control.unload(chat)
+            self.assertEqual(failed.exception.code, "model_control_failed")
+            self.replies["media.status"]["model"]["loaded"]["modelId"] = "image:second"
+            with self.assertRaises(ControlError) as stale:
+                self.control.unload(image)
+            self.assertEqual(stale.exception.code, "model_control_stale")
+            self.assertFalse(any(call.args[0] == "media.unload" for call in self.control.call.call_args_list))
+            image = self.control.status(instance)["loaded"][-1]
+            self.assertEqual(self.control.unload(image), {"category": "image"})
+            self.control.call.assert_called_with("media.unload")
+
+    def test_deletion_routes_completed_downloads_to_atomic_owners(self):
+        self.replies["models.installed"] = [
+            {"id": "chat", "provider": "llamacpp"},
+            {"id": "owner/managed", "provider": "vllm", "providers": []},
+            {"id": "imported", "provider": "llamacpp"},
+            {"id": "pending", "provider": "llamacpp"},
+            {"id": "chat", "provider": "mlx"},
+        ]
+        self.replies["setup.status"]["setups"] = [
+            {"setup_id": "chat-job", "stage": "ready", "plan": {"model_id": "chat"}},
+            {"setup_id": "new-chat-job", "stage": "ready", "plan": {"model_id": "chat"}, "updated_at": 100},
+            {"setup_id": "pending-job", "stage": "downloading", "plan": {"model_id": "pending"}},
+        ]
+        self.replies["managed.list"] = [
+            {"id": "managed-job", "stage": "ready", "plan": {"repository": "owner/managed"}},
+        ]
+        self.replies["artifacts.list"] = [
+            {"id": "mlx-job", "stage": "ready", "plan": {"model_id": "owner/mlx", "category": "text", "engine": "mlx"}},
+            {"id": "image-job", "stage": "ready", "plan": {"model_id": "image:q4", "category": "image"}},
+        ]
+        self.replies["downloads.remove"] = {"removed": True}
+        self.replies["models.remove"] = {"removed": True}
+        instance = {"sessions": []}
+        with patch.object(self.control, "verify_instance", return_value=instance):
+            models = self.control.installed()["models"]
+            for model, owner, job in zip(models, ("artifacts", "artifacts", "setup", "managed"),
+                                         ("mlx-job", "image-job", "chat-job", "managed-job")):
+                with self.subTest(owner=owner, job=job):
+                    self.assertEqual(self.control.delete({"id": model["delete_id"]}), {"category": model["category"]})
+                    if owner == "setup":
+                        self.control.call.assert_called_with("models.remove", {"model_id": "chat"}, timeout=90)
+                    else:
+                        self.control.call.assert_called_with(
+                            "downloads.remove", {"id": job, "owner": owner, "installed": True}, timeout=90,
+                        )
+            self.assertEqual([model["delete_id"] for model in models[-3:]], [None, None, None])
+            self.assertFalse(models[3]["loadable"])
+            with self.assertRaises(ControlError):
+                self.control.load(models[3])
+
+    def test_deletion_rechecks_loaded_state_and_serializes_mutations(self):
+        self.replies["models.installed"] = [{"id": "chat", "provider": "llamacpp"}]
+        self.replies["setup.status"]["setups"] = [
+            {"setup_id": "chat-job", "stage": "ready", "plan": {"model_id": "chat"}},
+        ]
+        model = self.control.installed()["models"][0]
+        request = {"id": model["delete_id"]}
+        with self.control.model_mutation, self.assertRaises(ControlError) as busy:
+            self.control.delete(request)
+        self.assertEqual(busy.exception.code, "model_control_busy")
+        for instance, expected in (
+            ({"sessions": [{"provider": "strata", "model_id": "chat"}]}, "model_control_still_loaded"),
+            ({"sessions": [{"model_id": "chat"}]}, "model_control_state_unknown"),
+        ):
+            with patch.object(self.control, "verify_instance", return_value=instance):
+                with self.assertRaises(ControlError) as error:
+                    self.control.delete(request)
+                self.assertEqual(error.exception.code, expected)
+        self.replies["setup.status"]["setups"].clear()
+        with self.assertRaises(ControlError) as stale:
+            self.control.delete(request)
+        self.assertEqual(stale.exception.code, "model_control_stale")
+        self.assertFalse(any(call.args[0] in {"downloads.remove", "models.remove"}
+                             for call in self.control.call.call_args_list))
+
+    def test_delete_blocks_active_install_and_invalidates_accepted_review(self):
+        self.replies.update({
+            "models.installed": [{"id": "chat", "provider": "llamacpp"}],
+            "models.plan": {"digest": "a" * 64, "model_id": "chat"},
+            "models.install": {},
+            "models.remove": {"removed": True},
+        })
+        setups = self.replies["setup.status"]["setups"]
+        setups.append({"setup_id": "ready-job", "stage": "ready", "plan": {"model_id": "chat"}})
+        chosen = {"id": self.control.remember("gguf", {"repo": "owner/chat", "file": "chat.gguf"})}
+        review = self.control.review(chosen)
+        self.control.download(review)
+        request_id = self.control.reviews[review["id"]]["request_id"]
+        target = {"id": self.control.installed()["models"][0]["delete_id"]}
+        setups.append({"setup_id": "new-job", "stage": "downloading", "plan": {"model_id": "chat"}})
+        with self.assertRaises(ControlError) as stale:
+            self.control.delete(target)
+        self.assertEqual(stale.exception.code, "model_control_stale")
+        setups.pop()
+        with patch.object(self.control, "verify_instance", return_value={"sessions": []}):
+            self.control.delete(target)
+        review = self.control.review(chosen)
+        self.control.download(review)
+        self.assertNotEqual(self.control.call.call_args.args[1]["request_id"], request_id)

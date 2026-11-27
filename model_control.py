@@ -19,6 +19,7 @@ OPERATIONS = frozenset({
     "models.plan", "models.install", "models.installed", "models.load",
     "artifacts.plan", "artifacts.install", "artifacts.list", "artifacts.load",
     "managed.plan", "managed.install", "managed.list", "setup.status",
+    "models.unload", "models.remove", "media.status", "media.unload", "downloads.remove",
 })
 MANAGED = {"vllm", "sglang", "tensorrt-llm"}
 GGUF = {"llamacpp", "llamacpp-upstream", "atomic-prism"}
@@ -94,6 +95,8 @@ class ModelControl:
         self.selections = {}
         self.reviews = {}
         self.loads = []
+        self.model_mutation = threading.Lock()
+        self.download_mutation = threading.Lock()
 
     def run(self, args, timeout):
         env = {key: value for key, value in os.environ.items() if key not in {
@@ -333,12 +336,22 @@ class ModelControl:
                     raise ControlError(503, "model_control_busy")
                 self.reviews[identifier] = {"expires": now + REVIEW_TTL, "kind": kind, "request": request,
                                             "digest": digest, "request_id": str(uuid4()), "active": False,
-                                            "accepted": False, "blocked": bool(blockers)}
+                                            "accepted": False, "blocked": bool(blockers),
+                                            "model": (plan.get("category", "text"),
+                                                      plan.get("model_id") or plan.get("repository"))}
             else:
                 self.reviews[identifier].update(expires=now + REVIEW_TTL, blocked=bool(blockers))
         return {"id": identifier, **info}
 
     def download(self, data):
+        if not self.download_mutation.acquire(blocking=False):
+            raise ControlError(503, "model_control_busy")
+        try:
+            return self.submit_download(data)
+        finally:
+            self.download_mutation.release()
+
+    def submit_download(self, data):
         identifier = data.get("id")
         with self.lock:
             review = self.reviews.get(identifier) if isinstance(identifier, str) else None
@@ -382,7 +395,7 @@ class ModelControl:
                 mlx_artifacts.add(model_id)
             installed.append((self.handle("load", category, artifact_id), category,
                               f"{name} · {variant}" if variant else name, "mlx" if is_mlx else "sd-cpp",
-                              "artifacts.load", {"id": artifact_id}))
+                              "artifacts.load", {"id": artifact_id}, model_id))
         for row in objects(self.call("models.installed")):
             model = row.get("id") or row.get("model_id")
             provider = row.get("provider") or row.get("engine")
@@ -390,42 +403,194 @@ class ModelControl:
                 continue
             fallback = self.label(model.replace("\\", "/").rsplit("/", 1)[-1])
             alternatives = row.get("providers")
-            if provider in MANAGED and isinstance(alternatives, list) and provider not in alternatives:
-                continue
             providers = [provider]
             if isinstance(alternatives, list):
                 providers.extend(item for item in alternatives if isinstance(item, str)
                                  and item in PROVIDERS and item not in providers)
+            unavailable = provider in MANAGED and isinstance(alternatives, list) and not alternatives
+            if provider in MANAGED and isinstance(alternatives, list) and alternatives:
+                providers = [engine for engine in providers if engine in alternatives]
             for engine in providers:
                 if engine == "mlx" and model in mlx_artifacts:
                     continue
                 installed.append((self.handle("load", "text", engine, model), "text",
                                   self.label(row.get("name"), fallback), engine,
-                                  "models.load", {"provider": engine, "model_id": model}))
+                                  None if unavailable else "models.load",
+                                  {"provider": engine, "model_id": model}, model))
         return installed
 
+    def loaded_inventory(self, instance):
+        chat = instance.get("sessions")
+        available = isinstance(chat, list)
+        loaded = []
+        for session in chat if isinstance(chat, list) else []:
+            session = mapping(session)
+            provider, model = session.get("provider"), session.get("model_id")
+            if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+                available = False
+                continue
+            loaded.append(("text", provider, model, self.model_label(model)))
+
+        try:
+            image = mapping(mapping(self.call("media.status")).get("model"))
+        except ControlError:
+            image = {}
+        state = image.get("state")
+        image_known = state == "unloaded"
+        if state == "loaded":
+            details = mapping(image.get("loaded"))
+            model = details.get("modelId")
+            modality = details.get("modality")
+            image_known = modality in ("image", "video") and isinstance(model, str) and bool(model)
+            if image_known and modality == "image":
+                loaded.append(("image", "sd-cpp", model,
+                               self.label(details.get("displayName"), self.model_label(model))))
+        return {"text": available, "image": image_known}, loaded
+
+    def model_label(self, model):
+        return self.label(model.replace("\\", "/").rsplit("/", 1)[-1])
+
+    def download_sources(self):
+        return [
+            ("setup", mapping(self.call("setup.status")).get("setups"), "text"),
+            ("managed", self.call("managed.list"), "text"),
+            ("artifacts", self.call("artifacts.list"), None),
+        ]
+
+    def delete_records(self):
+        records = {}
+        active = set()
+        for owner, rows, category in self.download_sources():
+            ordered = sorted(objects(rows), key=lambda row: number(row.get("updated_at")) or 0, reverse=True)
+            for row in ordered:
+                plan = mapping(row.get("plan"))
+                kind = category or plan.get("category")
+                model = plan.get("repository") if owner == "managed" else plan.get("model_id")
+                identifier = row.get("setup_id") if owner == "setup" else row.get("id")
+                if kind not in ("text", "image") or not isinstance(model, str) or not model:
+                    continue
+                stage = row.get("stage")
+                if not isinstance(stage, str) or stage not in TERMINAL:
+                    active.add((kind, model))
+                if stage != "ready":
+                    continue
+                if not isinstance(identifier, str) or not identifier:
+                    continue
+                records.setdefault((kind, model), []).append((owner, identifier))
+        return {key: targets for key, targets in records.items() if key not in active}
+
+    def deletion_target(self, row, records):
+        _, kind, _, provider, operation, payload, model = row
+        if not isinstance(model, str):
+            return None
+        matches = records.get((kind, model), [])
+        if operation == "artifacts.load":
+            target = ("artifacts", payload["id"])
+            return target if target in matches else None
+        if provider not in GGUF | MANAGED:
+            return None
+        owner = "managed" if provider in MANAGED else "setup"
+        matches = [target for target in matches if target[0] == owner]
+        if owner == "setup":
+            return next(iter(matches), None)
+        return matches[0] if len(matches) == 1 else None
+
     def installed(self):
-        return {"models": [{"id": identifier, "category": category, "label": label, "provider": provider}
-                           for identifier, category, label, provider, _, _ in self.inventory()]}
+        records = self.delete_records()
+        return {"models": [
+            {"id": row[0], "category": row[1], "label": row[2], "provider": row[3],
+             "loadable": row[4] is not None,
+             "delete_id": self.handle("delete", row[0], *target) if target else None,
+             "loaded_key": self.handle("model", row[1], row[6])}
+            for row in self.inventory()
+            for target in [self.deletion_target(row, records)]
+        ]}
 
     def load(self, data):
-        with self.lock:
-            if self.loads and self.loads[-1]["status"] == "loading":
-                raise ControlError(503, "model_control_busy")
-        selected = next((row for row in self.inventory() if row[0] == data.get("id")), None)
-        if selected is None:
+        self.acquire_mutation()
+        job = None
+        try:
+            selected = next((row for row in self.inventory() if row[0] == data.get("id")), None)
+            if selected is None or selected[4] is None:
+                raise ControlError(409, "model_control_stale")
+            identifier, category, label, _, operation, payload, _ = selected
+            job = {"id": str(uuid4()), "selection": identifier, "category": category, "label": label,
+                   "status": "loading"}
+            with self.lock:
+                self.loads.append(job)
+                del self.loads[:-20]
+            accepted = dict(job)
+            threading.Thread(target=self.finish_load, args=(job, operation, payload), daemon=True).start()
+            return {"load": accepted}
+        except BaseException:
+            if job is not None:
+                with self.lock:
+                    job.update(status="failed", error="model_control_failed")
+            self.model_mutation.release()
+            raise
+
+    def unload(self, data):
+        self.acquire_mutation()
+        try:
+            available, loaded = self.loaded_inventory(self.verify_instance())
+            for category, provider, model, _ in loaded:
+                if available[category] and self.handle("unload", category, provider, model) == data.get("id"):
+                    if category == "text":
+                        result = self.call("models.unload", {"provider": provider, "model_id": model})
+                        if mapping(result).get("success") is not True:
+                            raise ControlError(502, "model_control_failed")
+                    else:
+                        self.call("media.unload")
+                    return {"category": category}
             raise ControlError(409, "model_control_stale")
-        identifier, category, label, _, operation, payload = selected
-        job = {"id": str(uuid4()), "selection": identifier, "category": category, "label": label,
-               "status": "loading"}
-        with self.lock:
-            if self.loads and self.loads[-1]["status"] == "loading":
+        finally:
+            self.model_mutation.release()
+
+    def delete(self, data):
+        self.acquire_mutation()
+        try:
+            if not self.download_mutation.acquire(blocking=False):
                 raise ControlError(503, "model_control_busy")
-            self.loads.append(job)
-            del self.loads[:-20]
-        accepted = dict(job)
-        threading.Thread(target=self.finish_load, args=(job, operation, payload), daemon=True).start()
-        return {"load": accepted}
+            try:
+                return self.delete_selected(data)
+            finally:
+                self.download_mutation.release()
+        finally:
+            self.model_mutation.release()
+
+    def delete_selected(self, data):
+        records = self.delete_records()
+        for row in self.inventory():
+            target = self.deletion_target(row, records)
+            if not target or self.handle("delete", row[0], *target) != data.get("id"):
+                continue
+            category, model = row[1], row[6]
+            available, loaded = self.loaded_inventory(self.verify_instance())
+            if not available[category]:
+                raise ControlError(503, "model_control_state_unknown")
+            if any(kind == category and identifier == model for kind, _, identifier, _ in loaded):
+                raise ControlError(409, "model_control_still_loaded")
+            owner, identifier = target
+            if owner == "setup":
+                # Atomic 0.2.21 routes setup-journal removal through its managed registry.
+                result = self.call("models.remove", {"model_id": model}, timeout=90)
+                if mapping(result).get("removed") is not True:
+                    raise ControlError(502, "model_control_failed")
+            else:
+                result = self.call(
+                    "downloads.remove", {"id": identifier, "owner": owner, "installed": True}, timeout=90,
+                )
+                if mapping(result).get("removed") is not True:
+                    raise ControlError(502, "model_control_failed")
+            with self.lock:
+                self.reviews = {key: review for key, review in self.reviews.items()
+                                if review.get("model") != (category, model)}
+            return {"category": category}
+        raise ControlError(409, "model_control_stale")
+
+    def acquire_mutation(self):
+        if not self.model_mutation.acquire(blocking=False):
+            raise ControlError(503, "model_control_busy")
 
     def finish_load(self, job, operation, payload):
         state = "ready"
@@ -435,26 +600,42 @@ class ModelControl:
             self.call(operation, payload, timeout=600)
         except ControlError as exc:
             state, error = "failed", exc.code
-        with self.lock:
-            job.update(status=state, error=error)
+        except Exception:
+            state, error = "failed", "model_control_failed"
+        finally:
+            with self.lock:
+                job.update(status=state, error=error)
+            self.model_mutation.release()
 
     def status(self, instance):
-        setups = mapping(self.call("setup.status")).get("setups")
         downloads = []
-        sources = [(setups, "text"), (self.call("managed.list"), "text"), (self.call("artifacts.list"), None)]
+        sources = self.download_sources()
+        installed_gguf = None
+        completed_gguf = set()
         tasks = {}
         for task in objects(instance.get("downloads")):
             identifier = task.get("taskId") or task.get("task_id") or task.get("id")
             if isinstance(identifier, str):
                 tasks[identifier] = task
-        for rows, category in sources:
-            for row in objects(rows):
+        for owner, rows, category in sources:
+            ordered = sorted(objects(rows), key=lambda row: number(row.get("updated_at")) or 0, reverse=True)
+            for row in ordered:
                 plan = mapping(row.get("plan"))
                 kind = category or plan.get("category")
                 if kind not in ("text", "image"):
                     continue
                 stage = row.get("stage") or row.get("status")
                 stage = self.label(stage, "pending")
+                if owner == "setup" and stage == "ready":
+                    if installed_gguf is None:
+                        installed_gguf = {
+                            row[6] for row in self.inventory()
+                            if row[3] in GGUF and isinstance(row[6], str)
+                        }
+                    model_id = plan.get("model_id")
+                    if not isinstance(model_id, str) or model_id not in installed_gguf or model_id in completed_gguf:
+                        continue
+                    completed_gguf.add(model_id)
                 model = plan.get("name") or plan.get("model_id") or plan.get("repository") or row.get("model_id")
                 label = self.label(model.rsplit("/", 1)[-1]) if isinstance(model, str) else "Model"
                 ids = [row.get("id"), row.get("setup_id"), *mapping(row.get("task_ids")).values()]
@@ -476,13 +657,21 @@ class ModelControl:
         downloads.sort(key=lambda item: (item[0], item[1]), reverse=True)
         with self.lock:
             loads = [dict(job) for job in reversed(self.loads)]
-        return {"downloads": [job for _, _, job in downloads[:100]], "loads": loads}
+        available, loaded = self.loaded_inventory(instance)
+        return {"downloads": [job for _, _, job in downloads[:100]], "loads": loads,
+                "loaded_available": available, "loaded": [
+                    {"id": self.handle("unload", category, provider, model), "category": category,
+                     "provider": self.label(provider, "Engine"), "label": label,
+                     "key": self.handle("model", category, model)}
+                    for category, provider, model, label in loaded if available[category]
+                ]}
 
     def dispatch(self, route, method, data):
         methods = {
             ("catalog", "POST"): self.browse, ("search", "POST"): lambda value: self.browse(value, True),
             ("variants", "POST"): self.variants, ("review", "POST"): self.review,
             ("download", "POST"): self.download, ("load", "POST"): self.load,
+            ("unload", "POST"): self.unload, ("delete", "POST"): self.delete,
             ("installed", "GET"): lambda _: self.installed(),
         }
         handler = methods.get((route, method))
