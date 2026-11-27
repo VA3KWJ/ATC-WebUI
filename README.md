@@ -1,6 +1,6 @@
 # Atomic Server WebUI
 
-A lightweight browser interface for an existing Atomic Server public API. It provides streaming text chat, model selection, browser-local conversation history, light and dark themes, and an optional image generator and gallery link. The WebUI uses Python 3.10+ and the standard library.
+A lightweight browser interface for an existing Atomic Server public API. It provides streaming text chat, model selection, browser-local conversation history, light and dark themes, and optional image generation and a gallery for locally saved images. The WebUI uses Python 3.10+ and the standard library.
 
 ## Screenshots
 
@@ -88,6 +88,7 @@ python3 server.py
 | `ATC_WEBUI_IMAGE_MODEL` | Unset | Use the currently loaded Atomic image model when unset. Set an identifier to request a specific model, or set an empty value to disable image generation. |
 | `ATC_WEBUI_CONTROL_DATA_DIR` | Unset | Absolute path to the local Atomic Server data directory. Enables the sidebar's local image model status and, with automatic model selection, live generation progress. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
+| `ATC_WEBUI_GALLERY_DIR` | Unset | Absolute path to the local Atomic image directory. Enables the gallery in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
 
 ### Local image model status and progress
@@ -103,6 +104,18 @@ If Atomic Server uses a custom data directory, use that absolute path. It should
 Restart the WebUI after saving the setting. The **Local image model** row refreshes every 10 seconds while the tab is visible. It shows **Running** and the model name when an image model is loaded. If it shows **Status unavailable** while the public API is available, check that the running WebUI received the setting and can read the two files under the configured directory. Public API image generation can still work when local model status is unavailable.
 
 Leave `ATC_WEBUI_IMAGE_MODEL` unset to use the loaded local model and see live sampling steps and Atomic's estimated time remaining. An explicit image model override uses the public API and shows elapsed time during generation. If you use a reverse proxy, disable response buffering for image progress as well as chat.
+
+### Local image gallery
+
+To show Atomic's saved images in the **Images** view, add this setting to the WebUI configuration and restart the WebUI. Use the actual path if you moved Atomic's data directory.
+
+```sh
+ATC_WEBUI_GALLERY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/atomic-chat-cli/data/images"
+```
+
+Use a directory controlled by the Atomic Server account and readable by the WebUI. Everyone with access to the WebUI can view the configured image library. The grid shows the newest saved images first. Use **Refresh** to pick up images saved elsewhere and select a thumbnail to open the full-size image. The gallery also refreshes after successful generation and displays the result once Atomic has saved it in the configured directory.
+
+Hover over a gallery image or focus it with the keyboard to reveal **Save** and **Delete**. Both actions are always visible on touch devices. **Save** downloads a full-size PNG. **Delete** permanently removes the image and its thumbnail after confirmation. If the WebUI can write to the image directory, anyone with WebUI access can delete images.
 
 ## Network access
 

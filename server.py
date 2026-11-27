@@ -2,8 +2,10 @@
 
 GET /api/models returns opaque model IDs and labels. GET /api/image-model
 reports the local image model state and a display label. GET /api/config returns
-the gallery URL and whether image generation is enabled. POST /api/chat
-accepts a model ID and messages and emits delta, done, and error SSE events.
+the gallery URL and whether the local gallery and image generation are enabled.
+GET /api/gallery lists local PNGs. GET /api/gallery/<id> serves an image.
+DELETE /api/gallery/<id> removes an image and its thumbnail.
+POST /api/chat accepts a model ID and messages and emits delta, done, and error SSE events.
 POST /api/images takes a prompt and returns one image as binary data.
 
 Set ATC_API_URL to the upstream origin and choose ATC_API_TOKEN or
@@ -12,10 +14,12 @@ service account. ATC_WEBUI_HOST and ATC_WEBUI_PORT default to 127.0.0.1 and
 8080. Set ATC_WEBUI_PUBLIC_ORIGIN for a reverse proxy or wildcard bind.
 ATC_WEBUI_IMAGE_MODEL and ATC_WEBUI_GALLERY_URL are optional.
 ATC_WEBUI_CONTROL_DATA_DIR optionally enables local image job progress.
+ATC_WEBUI_GALLERY_DIR optionally exposes an Atomic image directory.
 """
 
 import base64
 import hashlib
+import heapq
 import hmac
 import http.client
 import ipaddress
@@ -29,6 +33,7 @@ import stat
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -49,6 +54,7 @@ MAX_STREAM = 4 * 1024 * 1024
 MAX_STREAM_LINE = 256 * 1024
 MAX_CLIENTS = 16
 MAX_IMAGE_CLIENTS = 2
+MAX_GALLERY_CLIENTS = 4
 IO_TIMEOUT = 15
 REQUEST_TIMEOUT = 180
 IMAGE_TIMEOUT = 600
@@ -57,6 +63,11 @@ IMAGE_POLL_INTERVAL = 0.5
 IMAGE_CHUNK_SIZE = 48 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 IMAGE_JOB_ID = re.compile(r"[0-9a-f]{32}")
+GALLERY_ID = r"[0-9a-f]{32}-[0-9]{2}"
+GALLERY_FILENAME = re.compile(rf"({GALLERY_ID})\.png")
+GALLERY_IMAGE_ROUTE = re.compile(rf"/api/gallery/({GALLERY_ID})(/thumbnail)?")
+GALLERY_CURSOR = re.compile(rf"before=(-?[0-9]{{1,20}})\.({GALLERY_ID})")
+GALLERY_PAGE_SIZE = 24
 IMAGE_PHASES = ("queued", "encoding", "sampling", "decoding", "postprocessing", "saving")
 BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/\-]+=*")
 PATH_SEPARATOR = re.compile(r"[/\\]")
@@ -148,6 +159,7 @@ class Config:
     gallery_url: str | None
     token: str = field(repr=False)
     control_data_dir: Path | None = None
+    gallery_dir: Path | None = None
 
     @classmethod
     def from_env(cls, env):
@@ -178,10 +190,14 @@ class Config:
             control_dir = env.get("ATC_WEBUI_CONTROL_DATA_DIR")
             if control_dir and not Path(control_dir).is_absolute():
                 raise ConfigurationError
+            gallery_dir = env.get("ATC_WEBUI_GALLERY_DIR")
+            if gallery_dir and not Path(gallery_dir).is_absolute():
+                raise ConfigurationError("Set ATC_WEBUI_GALLERY_DIR to an absolute path.")
             return cls(
                 address, port, origin(upstream), public_origin,
                 env.get("ATC_WEBUI_IMAGE_MODEL"), gallery, token,
                 Path(control_dir) if control_dir else None,
+                Path(gallery_dir) if gallery_dir else None,
             )
         except ConfigurationError:
             raise
@@ -303,22 +319,29 @@ def image_progress(job):
     return progress
 
 
+def read_png_file(directory_fd, filename):
+    image_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    with os.fdopen(image_fd, "rb") as image:
+        if not stat.S_ISREG(os.fstat(image.fileno()).st_mode):
+            raise APIError(502, "invalid_upstream_response")
+        return image.read(MAX_IMAGE + 1)
+
+
 def gallery_png(directory, job_id, tokens):
-    """Read only the completed job's first PNG and omit the gallery's embedded recipe."""
+    """Read the completed job's first PNG for the generation preview."""
     try:
         directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            image_fd = os.open(
-                f"{job_id}-00.png", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd,
-            )
-            with os.fdopen(image_fd, "rb") as image:
-                if not stat.S_ISREG(os.fstat(image.fileno()).st_mode):
-                    raise APIError(502, "invalid_upstream_response")
-                body = image.read(MAX_IMAGE + 1)
+            body = read_png_file(directory_fd, f"{job_id}-00.png")
         finally:
             os.close(directory_fd)
     except (OSError, ValueError):
         raise APIError(502, "invalid_upstream_response") from None
+    return strip_png_metadata(body, tokens)
+
+
+def strip_png_metadata(body, tokens):
+    """Keep the PNG's pixels and transparency while omitting its embedded recipe."""
     if len(body) > MAX_IMAGE:
         raise APIError(502, "upstream_response_too_large")
     if not body.startswith(PNG_SIGNATURE) or any(token.encode("ascii") in body for token in tokens):
@@ -339,6 +362,21 @@ def gallery_png(directory, job_id, tokens):
             return preview
         position = end
     raise APIError(502, "invalid_upstream_response")
+
+
+def gallery_entries(directory_fd, before):
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            match = GALLERY_FILENAME.fullmatch(entry.name)
+            if not match:
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            key = info.st_mtime_ns, match[1]
+            if stat.S_ISREG(info.st_mode) and 0 < info.st_size <= MAX_IMAGE and (before is None or key < before):
+                yield key
 
 
 class ChatTextFilter:
@@ -422,6 +460,7 @@ class WebUIServer(ThreadingMixIn, HTTPServer):
         self.config = config
         self.slots = threading.BoundedSemaphore(MAX_CLIENTS)
         self.image_slots = threading.BoundedSemaphore(MAX_IMAGE_CLIENTS)
+        self.gallery_slots = threading.BoundedSemaphore(MAX_GALLERY_CLIENTS)
         self.selector_key = secrets.token_bytes(32)
         self.models = {}
         if ":" in config.address:
@@ -492,13 +531,15 @@ class WebUIHandler(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None):
         self.send_json(code, {"error": "invalid_http_request"})
 
-    def send_headers(self, status, media_type, length=None):
+    def send_headers(self, status, media_type, length=None, *, same_origin=False):
         self.send_response(status)
         self.send_header("Content-Type", media_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'")
+        if same_origin:
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         if length is not None:
             self.send_header("Content-Length", str(length))
         self.end_headers()
@@ -508,7 +549,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
         self.send_headers(status, "application/json", len(body))
         self.wfile.write(body)
 
-    def check_origin(self, write):
+    def check_origin(self, require_same_origin):
         config = self.server.config
         hosts = self.headers.get_all("Host", [])
         origins = self.headers.get_all("Origin", [])
@@ -532,23 +573,34 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     and (host_url.port or 80) == self.server.server_port
                 )
                 expected = origin(host_url)
-            if not allowed or (write and origins and origins[0] != expected):
+            if not allowed or (require_same_origin and origins and origins[0] != expected):
                 raise ConfigurationError
-            if write and self.headers.get("Sec-Fetch-Site") in {"cross-site", "same-site"}:
+            if require_same_origin and self.headers.get("Sec-Fetch-Site") in {"cross-site", "same-site"}:
                 raise ConfigurationError
         except ValueError:
             raise APIError(403, "origin_forbidden") from None
 
     def do_GET(self):
-        self.dispatch(write=False)
+        self.dispatch()
 
     def do_POST(self):
-        self.dispatch(write=True)
+        self.dispatch()
 
-    def dispatch(self, write):
+    def do_DELETE(self):
+        self.dispatch()
+
+    def dispatch(self):
         try:
-            self.check_origin(write)
-            if write:
+            write = self.command != "GET"
+            path, separator, query = self.path.partition("?")
+            gallery_list = not write and path == "/api/gallery"
+            gallery_image = None if separator else GALLERY_IMAGE_ROUTE.fullmatch(path)
+            self.check_origin(write or gallery_list or gallery_image is not None)
+            if self.command == "DELETE":
+                if not gallery_image or gallery_image[2]:
+                    raise APIError(404, "route_not_found")
+                self.delete_gallery_image(gallery_image[1])
+            elif write:
                 if self.path == "/api/chat":
                     self.chat(self.read_json())
                 elif self.path == "/api/images":
@@ -562,8 +614,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/config":
                 self.send_json(200, {
                     "gallery_url": self.server.config.gallery_url,
+                    "gallery_enabled": self.server.config.gallery_dir is not None,
                     "image_enabled": self.server.config.image_model != "",
                 })
+            elif gallery_list:
+                self.list_gallery(query if separator else None)
+            elif gallery_image:
+                self.send_gallery_image(gallery_image[1], thumbnail=gallery_image[2] is not None)
             elif self.path in STATIC_ROUTES:
                 filename, media_type = STATIC_ROUTES[self.path]
                 try:
@@ -581,6 +638,92 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 return
         except (ConnectionError, TimeoutError):
             return
+
+    @contextmanager
+    def open_gallery(self):
+        directory = self.server.config.gallery_dir
+        if directory is None:
+            raise APIError(404, "route_not_found")
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            raise APIError(503, "gallery_unavailable") from None
+        try:
+            yield directory_fd
+        finally:
+            os.close(directory_fd)
+
+    def list_gallery(self, query):
+        with self.open_gallery() as directory_fd:
+            before = None
+            if query is not None:
+                match = GALLERY_CURSOR.fullmatch(query)
+                if not match:
+                    raise APIError(400, "invalid_gallery_cursor")
+                before = int(match[1]), match[2]
+            try:
+                page = heapq.nlargest(GALLERY_PAGE_SIZE + 1, gallery_entries(directory_fd, before))
+            except OSError:
+                raise APIError(503, "gallery_unavailable") from None
+        images = page[:GALLERY_PAGE_SIZE]
+        next_cursor = None
+        if len(page) > GALLERY_PAGE_SIZE:
+            modified, image_id = images[-1]
+            next_cursor = f"{modified}.{image_id}"
+        self.send_json(200, {
+            "images": [{"id": image_id, "modified_ms": modified // 1_000_000} for modified, image_id in images],
+            "next_cursor": next_cursor,
+        })
+
+    def send_gallery_image(self, image_id, thumbnail):
+        # A thumbnail fallback can buffer a full-sized image.
+        if not self.server.gallery_slots.acquire(timeout=1):
+            raise APIError(503, "gallery_busy")
+        try:
+            body = self.read_gallery_image(image_id, thumbnail)
+            self.send_headers(200, "image/png", len(body), same_origin=True)
+            self.wfile.write(body)
+        finally:
+            self.server.gallery_slots.release()
+
+    def read_gallery_image(self, image_id, thumbnail):
+        filename = f"{image_id}.png"
+        tokens = (self.server.config.token,)
+        with self.open_gallery() as directory_fd:
+            try:
+                if thumbnail:
+                    info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_IMAGE:
+                        raise APIError(404, "gallery_image_unavailable")
+                    try:
+                        return strip_png_metadata(read_png_file(directory_fd, f"{image_id}.thumb.png"), tokens)
+                    except (OSError, APIError):
+                        pass
+                return strip_png_metadata(read_png_file(directory_fd, filename), tokens)
+            except (OSError, APIError):
+                raise APIError(404, "gallery_image_unavailable") from None
+
+    def delete_gallery_image(self, image_id):
+        filename = f"{image_id}.png"
+        thumbnail = f"{image_id}.thumb.png"
+        with self.open_gallery() as directory_fd:
+            try:
+                info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise APIError(404, "gallery_image_unavailable")
+                # Remove the thumbnail first so a cleanup failure leaves the original intact.
+                try:
+                    info = os.stat(thumbnail, dir_fd=directory_fd, follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode):
+                        os.unlink(thumbnail, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+                os.unlink(filename, dir_fd=directory_fd)
+            except FileNotFoundError:
+                raise APIError(404, "gallery_image_unavailable") from None
+            except OSError:
+                raise APIError(503, "gallery_delete_failed") from None
+        self.send_headers(204, "application/json")
 
     def read_json(self):
         lengths = self.headers.get_all("Content-Length", [])

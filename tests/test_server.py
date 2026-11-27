@@ -139,6 +139,15 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(server.ConfigurationError):
                 server.Config.from_env(self.env | {"ATC_API_TOKEN_FILE": str(fifo)})
 
+    def test_gallery_directory_is_optional_and_absolute(self):
+        env = self.env | {"ATC_API_TOKEN": TOKEN}
+        self.assertIsNone(server.Config.from_env(env).gallery_dir)
+        path = Path("/atomic/data/images")
+        config = server.Config.from_env(env | {"ATC_WEBUI_GALLERY_DIR": str(path)})
+        self.assertEqual(config.gallery_dir, path)
+        with self.assertRaisesRegex(server.ConfigurationError, "ATC_WEBUI_GALLERY_DIR"):
+            server.Config.from_env(env | {"ATC_WEBUI_GALLERY_DIR": "data/images"})
+
     def test_upstream_must_be_an_origin_and_network_uses_https(self):
         for url in (
             "http://192.0.2.2",
@@ -206,11 +215,11 @@ class WebUITests(unittest.TestCase):
         self.ui = resources.enter_context(running(server.WebUIServer(replace(config, port=0))))
 
     @contextmanager
-    def response(self, route, payload=None, headers=None):
+    def response(self, route, payload=None, headers=None, *, method=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.ui.server_port, timeout=3)
         try:
             if payload is None:
-                connection.request("GET", route, headers=headers or {})
+                connection.request(method or "GET", route, headers=headers or {})
             else:
                 connection.request(
                     "POST", route, json.dumps(payload),
@@ -437,8 +446,185 @@ class WebUITests(unittest.TestCase):
         })
         with self.response("/api/config") as response:
             self.assertEqual(json.load(response), {
-                "gallery_url": "https://gallery.example.test/", "image_enabled": True,
+                "gallery_url": "https://gallery.example.test/", "gallery_enabled": False, "image_enabled": True,
             })
+
+    def test_gallery_lists_bounded_pages_newest_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            ids = [f"{index:032x}-00" for index in range(26)]
+            for index, image_id in enumerate(ids):
+                path = directory / f"{image_id}.png"
+                path.write_bytes(PNG)
+                timestamp = 1_700_000_000_000_000_000 + index // 2 * 1_000_000
+                os.utime(path, ns=(timestamp, timestamp))
+            (directory / f"{ids[-1]}.thumb.png").write_bytes(PNG)
+            (directory / "unrelated.png").write_bytes(PNG)
+            (directory / f"{0xff:032x}-00.png").symlink_to(directory / f"{ids[-1]}.png")
+            config = replace(self.ui.config, gallery_dir=directory, image_model="")
+            with patch.object(self.ui, "config", config):
+                with self.response("/api/config") as response:
+                    settings = json.load(response)
+                    self.assertTrue(settings["gallery_enabled"])
+                    self.assertFalse(settings["image_enabled"])
+                with self.response("/api/gallery") as response:
+                    self.assertEqual(response.status, 200)
+                    page = json.load(response)
+                    self.assertEqual([item["id"] for item in page["images"]], ids[:1:-1])
+                    self.assertEqual(page["images"][0], {"id": ids[-1], "modified_ms": 1700000000012})
+                (directory / f"{ids[2]}.png").unlink()
+                (directory / f"{0xab:032x}-00.png").write_bytes(PNG)
+                with self.response(f"/api/gallery?before={page['next_cursor']}") as response:
+                    self.assertEqual(response.status, 200)
+                    page = json.load(response)
+                    self.assertEqual([item["id"] for item in page["images"]], ids[1::-1])
+                    self.assertIsNone(page["next_cursor"])
+                with self.response("/api/gallery?before=invalid") as response:
+                    self.assertEqual(response.status, 400)
+
+    def test_gallery_serves_sanitized_images_and_falls_back_to_originals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            image_id = f"{IMAGE_JOB}-01"
+            original = directory / f"{image_id}.png"
+            thumb = directory / f"{image_id}.thumb.png"
+            route = f"/api/gallery/{image_id}"
+
+            recipe = b"tEXtatomic\0/private/gallery/recipe"
+            chunk = (len(recipe) - 4).to_bytes(4, "big") + recipe + zlib.crc32(recipe).to_bytes(4, "big")
+            original.write_bytes(PNG[:-12] + chunk + PNG[-12:])
+            def png_chunk(kind, data):
+                payload = kind + data
+                return len(data).to_bytes(4, "big") + payload + zlib.crc32(payload).to_bytes(4, "big")
+
+            thumbnail = (server.PNG_SIGNATURE
+                         + png_chunk(b"IHDR", bytes.fromhex("00000001000000010802000000"))
+                         + png_chunk(b"IDAT", zlib.compress(b"\x00\x77\x44\xaa"))
+                         + png_chunk(b"IEND", b""))
+            thumb.write_bytes(thumbnail)
+            config = replace(self.ui.config, gallery_dir=directory)
+            with patch.object(self.ui, "config", config):
+                with patch.object(server, "MAX_IMAGE", len(PNG)):
+                    with self.response(route + "/thumbnail") as response:
+                        self.assertEqual(response.status, 404)
+                with self.response(route + "/thumbnail") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), thumbnail)
+                with self.response(route) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Content-Type"), "image/png")
+                    self.assertEqual(response.getheader("Cross-Origin-Resource-Policy"), "same-origin")
+                    self.assertEqual(response.read(), PNG)
+                thumb.unlink()
+                for bad_thumbnail in ("absent", "symlink", "corrupt"):
+                    with self.subTest(thumbnail=bad_thumbnail):
+                        if bad_thumbnail == "symlink":
+                            thumb.symlink_to(original)
+                        elif bad_thumbnail == "corrupt":
+                            thumb.unlink()
+                            thumb.write_bytes(b"broken png")
+                        with self.response(route + "/thumbnail") as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(response.read(), PNG)
+
+    def test_gallery_handles_unavailable_directories_and_rejects_unsafe_requests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / "images"
+            route = f"/api/gallery/{IMAGE_JOB}-00"
+            with self.response("/api/gallery") as response:
+                self.assertEqual(response.status, 404)
+            config = replace(self.ui.config, gallery_dir=directory)
+            with patch.object(self.ui, "config", config):
+                with self.response("/api/gallery") as response:
+                    self.assertEqual(response.status, 503)
+                    self.assertEqual(json.load(response), {"error": "gallery_unavailable"})
+                directory.mkdir()
+                with self.response("/api/gallery") as response:
+                    self.assertEqual(json.load(response), {"images": [], "next_cursor": None})
+                image = directory / f"{IMAGE_JOB}-00.png"
+                other = directory.parent / "other.png"
+                other.write_bytes(PNG)
+                image.symlink_to(other)
+                for path in (route, route + "/thumbnail", "/api/gallery/%2e%2e/other.png"):
+                    with self.subTest(path=path), self.response(path) as response:
+                        self.assertEqual(response.status, 404)
+                image.unlink()
+                os.mkfifo(image)
+                with self.response(route) as response:
+                    self.assertEqual(response.status, 404)
+                for headers in ({"Origin": "https://other.example"}, {"Sec-Fetch-Site": "cross-site"}):
+                    for path in ("/api/gallery", route):
+                        with self.subTest(headers=headers, path=path), self.response(path, headers=headers) as response:
+                            self.assertEqual(response.status, 403)
+
+    def test_gallery_image_limit_does_not_block_the_listing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = replace(self.ui.config, gallery_dir=Path(folder))
+            slots = self.ui.gallery_slots
+            with patch.object(self.ui, "config", config), ExitStack() as held:
+                for _ in range(server.MAX_GALLERY_CLIENTS):
+                    held.enter_context(slots)
+                with self.response(f"/api/gallery/{IMAGE_JOB}-00") as response:
+                    self.assertEqual(response.status, 503)
+                    self.assertEqual(json.load(response), {"error": "gallery_busy"})
+                with self.response("/api/gallery") as response:
+                    self.assertEqual(response.status, 200)
+
+    def test_gallery_delete_removes_only_the_selected_image_and_thumbnail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            route = f"/api/gallery/{IMAGE_JOB}-00"
+            original = directory / f"{IMAGE_JOB}-00.png"
+            thumbnail = directory / f"{IMAGE_JOB}-00.thumb.png"
+            other = directory / f"{IMAGE_JOB}-01.png"
+            for file in (original, thumbnail, other):
+                file.write_bytes(PNG)
+            config = replace(self.ui.config, gallery_dir=directory)
+            with patch.object(self.ui, "config", config):
+                for path, headers, expected in (
+                    (route, {"Origin": "https://other.example"}, 403),
+                    (route, {"Sec-Fetch-Site": "same-site"}, 403),
+                    (route + "/thumbnail", {}, 404),
+                    (route + "?extra=1", {}, 404),
+                    ("/api/gallery/%2e%2e/other.png", {}, 404),
+                ):
+                    with self.subTest(path=path, headers=headers):
+                        with self.response(path, headers=headers, method="DELETE") as response:
+                            self.assertEqual(response.status, expected)
+                        self.assertTrue(original.is_file())
+                        self.assertTrue(thumbnail.is_file())
+                with self.response(route, method="DELETE") as response:
+                    self.assertEqual(response.status, 204)
+                self.assertFalse(original.exists())
+                self.assertFalse(thumbnail.exists())
+                self.assertTrue(other.is_file())
+                with self.response(route, method="DELETE") as response:
+                    self.assertEqual(response.status, 404)
+                with self.response("/api/gallery") as response:
+                    self.assertEqual([image["id"] for image in json.load(response)["images"]], [f"{IMAGE_JOB}-01"])
+
+    def test_gallery_delete_preserves_original_on_thumbnail_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            route = f"/api/gallery/{IMAGE_JOB}-00"
+            original = directory / f"{IMAGE_JOB}-00.png"
+            thumbnail = directory / f"{IMAGE_JOB}-00.thumb.png"
+            thumbnail.write_bytes(PNG)
+            original.symlink_to(thumbnail)
+            config = replace(self.ui.config, gallery_dir=directory)
+            with patch.object(self.ui, "config", config):
+                with self.response(route, method="DELETE") as response:
+                    self.assertEqual(response.status, 404)
+                self.assertTrue(original.is_symlink())
+                self.assertTrue(thumbnail.is_file())
+                original.unlink()
+                original.write_bytes(PNG)
+                with patch.object(server.os, "unlink", side_effect=PermissionError):
+                    with self.response(route, method="DELETE") as response:
+                        self.assertEqual(response.status, 503)
+                        self.assertEqual(json.load(response), {"error": "gallery_delete_failed"})
+                self.assertTrue(original.is_file())
+                self.assertTrue(thumbnail.is_file())
 
     def test_image_uses_loaded_model_when_no_override_is_set(self):
         payload = {"prompt": "draw", "n": 1, "response_format": "b64_json"}

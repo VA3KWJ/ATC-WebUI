@@ -11,6 +11,8 @@ const THEME_KEY = "atomic-webui.theme";
 const MAX_CHAT_REQUEST = 256 * 1024;
 const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
 const IMAGE_MODEL_REFRESH_MS = 10000;
+const GALLERY_IMAGE_ID = /^[0-9a-f]{32}-[0-9]{2}$/;
+const galleryDate = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const encoder = new TextEncoder();
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 const state = {
@@ -22,6 +24,7 @@ const state = {
   imageRequest: null,
   imageEnabled: false,
   previewUrl: null,
+  gallery: { enabled: false, loaded: false, nextCursor: null, request: null },
 };
 
 const errors = {
@@ -35,6 +38,9 @@ const errors = {
   image_out_of_memory: "Atomic ran out of memory while generating the image.",
   image_stream_interrupted: "Image progress was interrupted. Try again.",
   image_busy: "The server is already generating images. Try again shortly.",
+  gallery_unavailable: "Could not read Atomic’s image library. Try refreshing the gallery.",
+  gallery_image_unavailable: "This image is no longer available. Refresh the gallery.",
+  gallery_delete_failed: "Could not delete this image. Check that the WebUI can write to the image directory.",
   invalid_prompt: "Enter an image prompt.",
   invalid_messages: "The conversation could not be sent. Start a new conversation and try again.",
   request_too_large: "The request is too large. Shorten your message and try again.",
@@ -167,6 +173,7 @@ function showView(view) {
   elements.images.hidden = view !== "images";
   elements["chat-view"].setAttribute("aria-pressed", String(view === "chat"));
   elements["image-view"].setAttribute("aria-pressed", String(view === "images"));
+  if (view === "images" && !state.gallery.loaded && !state.gallery.request) loadGallery();
 }
 
 function renderHistory() {
@@ -341,6 +348,9 @@ async function loadImageConfig() {
     const response = await request("/api/config");
     const config = await response.json();
     state.imageEnabled = config.image_enabled === true;
+    state.gallery.enabled = config.gallery_enabled === true;
+    elements["local-gallery"].hidden = !state.gallery.enabled;
+    if (!elements.images.hidden) loadGallery();
     if (typeof config.gallery_url === "string") {
       try {
         const galleryUrl = new URL(config.gallery_url);
@@ -357,6 +367,112 @@ async function loadImageConfig() {
     feedback("image-status", error.message, "error");
   } finally {
     updateControls();
+  }
+}
+
+function galleryCard({ id, modified_ms }) {
+  const date = new Date(modified_ms);
+  const label = galleryDate.format(date);
+  const imageUrl = `/api/gallery/${id}`;
+  const card = document.createElement("figure");
+  card.dataset.imageId = id;
+  const link = document.createElement("a");
+  link.href = imageUrl;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  link.setAttribute("aria-label", `Open full-size image from ${label} in a new tab`);
+  const image = document.createElement("img");
+  image.loading = "lazy";
+  image.alt = "Generated image";
+  image.addEventListener("error", () => { image.src = imageUrl; }, { once: true });
+  image.src = `${imageUrl}/thumbnail`;
+  const caption = document.createElement("figcaption");
+  const time = document.createElement("time");
+  time.dateTime = date.toISOString();
+  time.textContent = label;
+  caption.append(time);
+  link.append(image);
+  const actions = document.createElement("div");
+  actions.className = "gallery-actions";
+  const save = document.createElement("a");
+  save.className = "secondary action-link";
+  save.href = imageUrl;
+  save.download = `generated-${id}.png`;
+  save.textContent = "Save";
+  save.setAttribute("aria-label", `Save image from ${label}`);
+  const remove = document.createElement("button");
+  remove.className = "secondary";
+  remove.type = "button";
+  remove.textContent = "Delete";
+  remove.setAttribute("aria-label", `Delete image from ${label}`);
+  remove.addEventListener("click", async () => {
+    if (!window.confirm("Permanently delete this image from Atomic’s library?")) return;
+    const hadFocus = card.contains(document.activeElement);
+    remove.disabled = true;
+    try {
+      await request(imageUrl, { method: "DELETE" });
+      const gallery = state.gallery;
+      gallery.request?.abort();
+      const grid = elements["gallery-grid"];
+      const currentCard = grid.querySelector(`[data-image-id="${id}"]`);
+      if (currentCard?.contains(document.activeElement) || (hadFocus && document.activeElement === document.body)) {
+        elements["gallery-refresh"].focus();
+      }
+      currentCard?.remove();
+      const hasCards = grid.childElementCount > 0;
+      if (!hasCards && gallery.nextCursor) loadGallery();
+      else feedback("gallery-status", hasCards ? "Image deleted." : "No generated images yet.");
+    } catch (error) {
+      feedback("gallery-status", error.message, "error");
+      remove.disabled = false;
+      if (document.activeElement === document.body && card.isConnected) remove.focus();
+    }
+  });
+  actions.append(save, remove);
+  const media = document.createElement("div");
+  media.className = "gallery-media";
+  media.append(link, actions);
+  card.append(media, caption);
+  return card;
+}
+
+async function loadGallery(append = false) {
+  const gallery = state.gallery;
+  if (!gallery.enabled || (append && (!gallery.nextCursor || gallery.request))) return;
+  gallery.request?.abort();
+  const controller = new AbortController();
+  gallery.request = controller;
+  const grid = elements["gallery-grid"];
+  const more = elements["gallery-more"];
+  const query = append ? `?before=${encodeURIComponent(gallery.nextCursor)}` : "";
+  more.disabled = true;
+  grid.setAttribute("aria-busy", "true");
+  feedback("gallery-status", "Loading images…");
+  try {
+    const response = await request(`/api/gallery${query}`, { signal: controller.signal });
+    const page = await response.json();
+    controller.signal.throwIfAborted();
+    if (!Array.isArray(page?.images) || !page.images.every((image) =>
+      typeof image?.id === "string" && GALLERY_IMAGE_ID.test(image.id) &&
+      Number.isInteger(image.modified_ms) && Math.abs(image.modified_ms) <= 8.64e15
+    ) || (page.next_cursor !== null && typeof page.next_cursor !== "string")) {
+      throw new Error("The gallery returned an invalid response.");
+    }
+    const cards = page.images.map(galleryCard);
+    if (append) grid.append(...cards);
+    else grid.replaceChildren(...cards);
+    gallery.nextCursor = page.next_cursor;
+    gallery.loaded = true;
+    feedback("gallery-status", !append && !cards.length ? "No generated images yet." : "");
+  } catch (error) {
+    if (!controller.signal.aborted) feedback("gallery-status", error.message, "error");
+  } finally {
+    if (gallery.request === controller) {
+      gallery.request = null;
+      grid.setAttribute("aria-busy", "false");
+      more.hidden = !gallery.nextCursor;
+      more.disabled = false;
+    }
   }
 }
 
@@ -635,6 +751,7 @@ async function submitImage(event) {
     elements["image-caption"].textContent = prompt;
     elements.preview.hidden = false;
     feedback("image-status", "Image ready.");
+    loadGallery();
   } catch (error) {
     clearPreview();
     feedback("image-status", controller.signal.aborted ? "Image generation stopped." : error.message,
@@ -682,6 +799,8 @@ elements.stop.addEventListener("click", () => {
   updateControls();
 });
 elements["image-form"].addEventListener("submit", submitImage);
+elements["gallery-refresh"].addEventListener("click", () => loadGallery());
+elements["gallery-more"].addEventListener("click", () => loadGallery(true));
 elements["stop-image"].addEventListener("click", () => {
   state.imageRequest?.abort();
   updateControls();
