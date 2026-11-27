@@ -10,6 +10,7 @@ const pendingHistoryWrites = new Map();
 const THEME_KEY = "atomic-webui.theme";
 const MAX_CHAT_REQUEST = 256 * 1024;
 const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
+const IMAGE_MODEL_REFRESH_MS = 10000;
 const encoder = new TextEncoder();
 const systemTheme = window.matchMedia("(prefers-color-scheme: light)");
 const state = {
@@ -303,6 +304,38 @@ async function refreshModels() {
   }
 }
 
+const imageModelStatus = {
+  running: ["Running", "available"],
+  stopped: ["Not running", ""],
+  loading: ["Diffusion engine loading…", ""],
+  unloading: ["Diffusion engine unloading…", ""],
+  failed: ["Diffusion engine load failed", "error"],
+  unknown: ["Status unavailable", ""],
+};
+
+let checkingImageModel = false;
+async function refreshImageModel() {
+  if (checkingImageModel || document.hidden) return;
+  checkingImageModel = true;
+  let status = "unknown";
+  let name;
+  try {
+    const response = await request("/api/image-model");
+    const body = await response.json();
+    if (Object.hasOwn(imageModelStatus, body?.state)) status = body.state;
+    if (status === "running" && typeof body.name === "string") name = body.name;
+  } catch {
+    status = "unknown";
+  } finally {
+    checkingImageModel = false;
+  }
+  const [label, appearance] = imageModelStatus[status];
+  const message = `Local image model · ${label}${name ? ` · ${name}` : ""}`;
+  if (elements["image-model-status"].textContent !== message) {
+    feedback("image-model-status", message, appearance);
+  }
+}
+
 async function loadImageConfig() {
   try {
     const response = await request("/api/config");
@@ -496,10 +529,14 @@ async function submitChat(event) {
 function clearPreview() {
   elements.preview.hidden = true;
   elements["generated-image"].removeAttribute("src");
+  elements["open-image"].removeAttribute("href");
+  elements["download-image"].removeAttribute("href");
   elements["image-caption"].textContent = "";
   if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
   state.previewUrl = null;
 }
+
+const imageExtensions = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 
 const imagePhases = {
   queued: "Image queued…",
@@ -583,7 +620,7 @@ async function submitImage(event) {
     });
     const blob = await readImage(response);
     controller.signal.throwIfAborted();
-    if (!["image/png", "image/jpeg", "image/webp"].includes(blob.type)) {
+    if (!Object.hasOwn(imageExtensions, blob.type)) {
       throw new Error(errors.invalid_upstream_response);
     }
     state.previewUrl = URL.createObjectURL(blob);
@@ -592,6 +629,9 @@ async function submitImage(event) {
       throw new Error("The generated image could not be displayed.");
     });
     controller.signal.throwIfAborted();
+    elements["open-image"].href = state.previewUrl;
+    elements["download-image"].href = state.previewUrl;
+    elements["download-image"].download = `generated-image.${imageExtensions[blob.type]}`;
     elements["image-caption"].textContent = prompt;
     elements.preview.hidden = false;
     feedback("image-status", "Image ready.");
@@ -651,4 +691,7 @@ loadHistory();
 renderConversation();
 renderHistory();
 refreshModels();
+refreshImageModel();
+setInterval(refreshImageModel, IMAGE_MODEL_REFRESH_MS);
+document.addEventListener("visibilitychange", refreshImageModel);
 loadImageConfig();

@@ -1,6 +1,7 @@
 """Same-origin WebUI server for the Atomic Server public API.
 
-GET /api/models returns opaque model IDs and labels. GET /api/config returns
+GET /api/models returns opaque model IDs and labels. GET /api/image-model
+reports the local image model state and a display label. GET /api/config returns
 the gallery URL and whether image generation is enabled. POST /api/chat
 accepts a model ID and messages and emits delta, done, and error SSE events.
 POST /api/images takes a prompt and returns one image as binary data.
@@ -62,6 +63,7 @@ PATH_SEPARATOR = re.compile(r"[/\\]")
 PATH_DELIMITER = re.compile(r"""[\s"'<>()[\]{},;]""")
 DRIVE_PREFIX = re.compile(r"[A-Za-z]:$")
 SAFE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,79}")
+SAFE_IMAGE_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ :()+-]{0,95}")
 REDACTED = "[redacted]"
 
 
@@ -555,6 +557,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     raise APIError(404, "route_not_found")
             elif self.path == "/api/models":
                 self.discover_models()
+            elif self.path == "/api/image-model":
+                self.report_image_model()
             elif self.path == "/api/config":
                 self.send_json(200, {
                     "gallery_url": self.server.config.gallery_url,
@@ -693,6 +697,34 @@ class WebUIHandler(BaseHTTPRequestHandler):
             and item["id"] and not any(0xD800 <= ord(char) <= 0xDFFF for char in item["id"])
         )
         self.send_json(200, {"models": self.server.update_models(identifiers)})
+
+    def report_image_model(self):
+        config = self.server.config
+        if config.control_data_dir is None:
+            self.send_json(200, {"state": "unknown", "name": None})
+            return
+        control = AtomicImageControl(config.control_data_dir)
+        model = control.call("/status").get("model")
+        state = model.get("state") if isinstance(model, dict) else None
+        name = None
+        if state == "loaded":
+            loaded = model.get("loaded")
+            modality = loaded.get("modality") if isinstance(loaded, dict) else None
+            if modality == "image":
+                state = "running"
+                for key in ("displayName", "modelId"):
+                    label = loaded.get(key)
+                    if (isinstance(label, str) and SAFE_IMAGE_MODEL_NAME.fullmatch(label)
+                            and config.token not in label and control.token not in label):
+                        name = label
+                        break
+            else:
+                state = "stopped" if modality == "video" else "unknown"
+        elif state == "unloaded":
+            state = "stopped"
+        elif state not in ("loading", "unloading", "failed"):
+            state = "unknown"
+        self.send_json(200, {"state": state, "name": name})
 
     def chat(self, payload):
         selector = payload.get("model")

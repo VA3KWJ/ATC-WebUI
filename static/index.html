@@ -31,6 +31,7 @@
       <div class="connection">
         <p id="api-status" role="status">API · Checking…</p>
         <p id="model-status" role="status">Chat models · Checking…</p>
+        <p id="image-model-status" role="status">Local image model · Checking…</p>
         <button id="refresh" class="secondary" type="button">Refresh chat models</button>
       </div>
     </aside>
@@ -66,7 +67,7 @@
       <section id="images" class="panel" aria-labelledby="image-title" hidden>
         <header class="panel-heading">
           <h1 id="image-title">Images</h1>
-          <a id="gallery" class="secondary gallery" target="_blank" rel="noopener noreferrer" hidden>Open gallery ↗</a>
+          <a id="gallery" class="secondary action-link" target="_blank" rel="noopener noreferrer" hidden>Open gallery ↗</a>
         </header>
         <div class="image-workspace">
           <form id="image-form" class="composer">
@@ -83,8 +84,14 @@
             </div>
           </form>
           <figure id="preview" class="preview" hidden>
-            <img id="generated-image" alt="Generated image">
-            <figcaption id="image-caption"></figcaption>
+            <a id="open-image" class="preview-image-link" target="_blank" rel="noopener noreferrer"
+               aria-label="Open full-size image in a new tab">
+              <img id="generated-image" alt="Generated image">
+            </a>
+            <figcaption>
+              <span id="image-caption"></span>
+              <a id="download-image" class="secondary action-link" download>Download image</a>
+            </figcaption>
           </figure>
         </div>
       </section>

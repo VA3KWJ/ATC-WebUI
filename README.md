@@ -53,7 +53,7 @@ curl -fsSLo atc-webui-install.sh "https://raw.githubusercontent.com/VA3KWJ/ATC-W
 
 The launcher runs in the foreground. Press Ctrl+C to stop it. To rotate the token, replace the configured token file with the new token, retain ownership and mode `0600`, and restart the WebUI. The empty installation placeholder must be populated before startup.
 
-If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh chat models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The view shows elapsed time while waiting for the public API and offers a **Stop** button. If the model is unavailable, load it in Atomic Server and submit again. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
+If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh chat models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The view shows elapsed time while waiting for the public API and offers a **Stop** button. If the model is unavailable, load it in Atomic Server and submit again. A generated image preview lasts for the current page session. Click the preview to open the original image in a new tab or choose **Download image** to save it. Conversations and theme choices are stored in the current browser.
 
 Select **Stop** to end a streaming reply. Text already received stays in the conversation, including when the upstream stream is interrupted. Multiple tabs can save turns independently. Reload a tab to see turns saved in another tab. Existing browser history loads automatically.
 
@@ -92,7 +92,7 @@ python3 server.py
 
 ### Live image progress
 
-To show sampling steps and Atomic’s time estimate, run the WebUI as the same OS user as Atomic Server and add this setting to the WebUI configuration. Use your actual Atomic data directory if you moved it.
+To show the running image model in the sidebar, plus sampling steps and Atomic’s time estimate during generation, run the WebUI as the same OS user as Atomic Server and add this setting to the WebUI configuration. Use your actual Atomic data directory if you moved it.
 
 ```sh
 ATC_WEBUI_CONTROL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/atomic-chat-cli/data"

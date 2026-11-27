@@ -270,6 +270,40 @@ class WebUITests(unittest.TestCase):
         self.expect_call("GET", "/v1/models")
         return models[0]["id"]
 
+    def test_image_model_status_tracks_the_local_image_session(self):
+        image = {
+            "modality": "image", "displayName": "Z-Image Turbo (Q4_K_M)", "modelId": "z-image:q4_k_m",
+        }
+        cases = (
+            ({"state": "unloaded", "loaded": None}, "stopped", None),
+            ({"state": "loading", "loaded": None}, "loading", None),
+            ({"state": "loaded", "loaded": image}, "running", image["displayName"]),
+            ({"state": "unloading", "loaded": None}, "unloading", None),
+            ({"state": "loaded", "loaded": image | {"modality": "video"}}, "stopped", None),
+            ({"state": "failed", "error": {"message": MODEL}}, "failed", None),
+            ({"state": "loaded", "loaded": image | {"displayName": MODEL}}, "running", image["modelId"]),
+            ({"state": "loaded", "loaded": image | {
+                "displayName": CONTROL_TOKEN, "modelId": TOKEN,
+            }}, "running", None),
+            ({"state": "loaded", "loaded": None}, "unknown", None),
+        )
+        with self.image_control():
+            for model, state, name in cases:
+                with self.subTest(state=state, name=name):
+                    self.upstream.enqueue(200, {
+                        "model": model, "activeJob": {"request": {"prompt": "private prompt"}},
+                    })
+                    with self.response("/api/image-model") as response:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(json.load(response), {"state": state, "name": name})
+                    self.expect_control_call("GET", "/status")
+
+    def test_image_model_status_without_control_is_unknown(self):
+        with self.response("/api/image-model") as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response), {"state": "unknown", "name": None})
+        self.assertTrue(self.upstream.calls.empty())
+
     def test_discovery_uses_stable_opaque_ids_and_clears_unavailable_models(self):
         selector = self.discover()
         self.assertNotEqual(selector, MODEL)
