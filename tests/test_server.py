@@ -8,6 +8,7 @@ import queue
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
@@ -283,15 +284,61 @@ class WebUITests(unittest.TestCase):
 
     def test_interrupted_chat_preserves_partial_text_and_uses_generic_error(self):
         selector = self.discover()
-        self.upstream.stream(self.delta("Partial"), b'data: {"error":"raw secret"}\n\n')
         messages = [{"role": "user", "content": "Hello"}]
-        with self.response("/api/chat", {"model": selector, "messages": messages}) as response:
-            body = response.read()
-            self.assertEqual(response.status, 200)
-            self.assertIn(b"Partial", body)
-            self.assertIn(b"stream_interrupted", body)
-            self.assertNotIn(b"raw secret", body)
-            self.assertNotIn(b"event: done", body)
+        for tail in ("/", "/" + TOKEN[:8]):
+            with self.subTest(tail=tail):
+                self.upstream.stream(self.delta("Partial " + tail), b'data: {"error":"raw secret"}\n\n')
+                with self.response("/api/chat", {"model": selector, "messages": messages}) as response:
+                    body = response.read()
+                    self.assertEqual(response.status, 200)
+                    texts = [json.loads(line[6:])["text"] for line in body.splitlines()
+                             if line.startswith(b'data: {"text":')]
+                    self.assertEqual("".join(texts), "Partial /")
+                    self.assertIn(b"stream_interrupted", body)
+                    self.assertNotIn(b"raw secret", body)
+                    self.assertNotIn(b"event: done", body)
+
+    def test_chat_disconnect_releases_worker_while_upstream_is_idle(self):
+        selector = self.discover()
+        resume = threading.Event()
+        self.upstream.stream(self.delta("Partial"), resume)
+        messages = [{"role": "user", "content": "Hello"}]
+        try:
+            with self.response("/api/chat", {"model": selector, "messages": messages},
+                               {"X-ATC-Cancel-On-Disconnect": "1"}) as response:
+                self.assertEqual(response.readline(), b"event: delta\n")
+                self.assertIn(b"Partial", response.readline())
+            self.expect_call("POST", "/v1/chat/completions", {
+                "model": MODEL, "messages": messages, "stream": True,
+            })
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                slots = sum(self.ui.slots.acquire(blocking=False) for _ in range(server.MAX_CLIENTS))
+                for _ in range(slots):
+                    self.ui.slots.release()
+                if slots == server.MAX_CLIENTS:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(slots, server.MAX_CLIENTS)
+        finally:
+            resume.set()
+
+    def test_chat_api_accepts_half_closed_requests_without_cancellation_opt_in(self):
+        selector = self.discover()
+        payload = json.dumps({
+            "model": selector, "messages": [{"role": "user", "content": "Hello"}],
+        }).encode()
+        self.upstream.stream(self.delta("Hello"), b"data: [DONE]\n\n")
+        with socket.create_connection(("127.0.0.1", self.ui.server_port), timeout=2) as client:
+            client.sendall((
+                f"POST /api/chat HTTP/1.1\r\nHost: 127.0.0.1:{self.ui.server_port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n"
+            ).encode() + payload)
+            client.shutdown(socket.SHUT_WR)
+            with http.client.HTTPResponse(client) as response:
+                response.begin()
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"event: done", response.read())
 
     def test_image_returns_one_binary_preview_and_no_metadata(self):
         self.upstream.enqueue(200, {"data": [
@@ -309,6 +356,51 @@ class WebUITests(unittest.TestCase):
             self.assertEqual(json.load(response), {
                 "gallery_url": "https://gallery.example.test/", "image_enabled": True,
             })
+
+    def test_image_limit_leaves_room_for_chat_and_releases_after_completion(self):
+        selector = self.discover()
+        resume = threading.Event()
+        image = {"data": [{"b64_json": base64.b64encode(PNG).decode()}]}
+        body = json.dumps(image).encode()
+        image_payload = {
+            "model": "/private/image-model", "prompt": "draw", "n": 1, "response_format": "b64_json",
+        }
+        with ExitStack() as requests:
+            requests.callback(resume.set)
+            images = []
+            for _ in range(server.MAX_IMAGE_CLIENTS):
+                self.upstream.responses.put((200, {"Content-Length": len(body)}, [resume, body]))
+                connection = http.client.HTTPConnection("127.0.0.1", self.ui.server_port, timeout=3)
+                images.append(connection)
+                requests.callback(connection.close)
+                connection.request("POST", "/api/images", '{"prompt":"draw"}', {
+                    "Content-Type": "application/json",
+                })
+                self.expect_call("POST", "/v1/images/generations", image_payload)
+            with self.response("/api/images", {"prompt": "try later"}) as response:
+                self.assertEqual(response.status, 503)
+                self.assertEqual(json.load(response), {"error": "image_busy"})
+            self.upstream.stream(self.delta("Hello"), b"data: [DONE]\n\n")
+            messages = [{"role": "user", "content": "Hello"}]
+            with self.response("/api/chat", {"model": selector, "messages": messages}) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(b"event: done", response.read())
+            self.expect_call("POST", "/v1/chat/completions", {
+                "model": MODEL, "messages": messages, "stream": True,
+            })
+            resume.set()
+            for connection in images:
+                with connection.getresponse() as response:
+                    self.assertEqual(response.read(), PNG)
+        for _ in range(server.MAX_IMAGE_CLIENTS):
+            self.upstream.enqueue(500, {})
+            with self.response("/api/images", {"prompt": "draw"}) as response:
+                self.assertEqual(response.status, 502)
+            self.expect_call("POST", "/v1/images/generations", image_payload)
+        self.upstream.enqueue(200, image)
+        with self.response("/api/images", {"prompt": "draw"}) as response:
+            self.assertEqual(response.read(), PNG)
+        self.expect_call("POST", "/v1/images/generations", image_payload)
 
     def test_errors_and_redirects_never_forward_body_or_location(self):
         for status, error in (

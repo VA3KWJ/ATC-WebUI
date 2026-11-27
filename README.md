@@ -45,6 +45,8 @@ The launcher runs in the foreground. Press Ctrl+C to stop it. To rotate the toke
 
 If the API is reachable and no models are listed, make a suitable model available through Atomic Server and select **Refresh models**. Use the **Images** view after setting `ATC_WEBUI_IMAGE_MODEL`. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
 
+Select **Stop** to end a streaming reply. Text already received stays in the conversation, including when the upstream stream is interrupted. Multiple tabs can save turns independently. Reload a tab to see turns saved in another tab. Existing browser history loads automatically.
+
 ## Manual installation from a checkout
 
 Install Python 3.10+ and CA certificates using your distribution's package manager. Run these commands from the repository root to set up the token file for the first time.
@@ -81,7 +83,7 @@ python3 server.py
 
 For remote access, keep the WebUI bound to loopback behind an HTTPS reverse proxy. Require separate access authentication at the proxy. The Atomic API token authenticates only the WebUI's upstream requests.
 
-Set `ATC_WEBUI_PUBLIC_ORIGIN` to the external HTTPS origin and preserve the incoming host. Disable proxy buffering for streamed replies and allow time for the application's request deadline. The WebUI bounds upstream I/O waits to 15 seconds and uses a 180-second connection deadline. This example belongs inside an existing Nginx HTTPS server configuration.
+Set `ATC_WEBUI_PUBLIC_ORIGIN` to the external HTTPS origin and preserve the incoming host. Disable proxy buffering for streamed replies and allow time for the application's request deadline. The WebUI bounds upstream I/O waits to 15 seconds and uses a 180-second connection deadline. It accepts up to 16 concurrent connections, including up to two image generation requests at a time. Additional image requests return HTTP 503 while both image slots are occupied. This example belongs inside an existing Nginx HTTPS server configuration.
 
 ```nginx
 location / {
@@ -98,8 +100,11 @@ location / {
 
 ## Validation
 
+The server tests use Python 3.10+ and a local mock API. The browser history tests use Node.js 22 and a simulated browser environment.
+
 ```sh
 python3 -m unittest discover -s tests -v
+node --test tests/test_history.js
 ```
 
 See the [API compatibility notes](docs/api-compatibility.md) for mock and live test results.

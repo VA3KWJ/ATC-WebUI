@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import selectors
 import socket
 import stat
 import sys
@@ -44,6 +45,7 @@ MAX_IMAGE = 24 * 1024 * 1024
 MAX_STREAM = 4 * 1024 * 1024
 MAX_STREAM_LINE = 256 * 1024
 MAX_CLIENTS = 16
+MAX_IMAGE_CLIENTS = 2
 IO_TIMEOUT = 15
 REQUEST_TIMEOUT = 180
 BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/\-]+=*")
@@ -176,6 +178,24 @@ def close_socket(connection):
         pass
 
 
+def cancel_on_disconnect(client, upstream, finished):
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(client, selectors.EVENT_READ)
+            while not finished.is_set():
+                if not selector.select(timeout=0.1) or finished.is_set():
+                    continue
+                try:
+                    if client.recv(1, socket.MSG_PEEK):
+                        return
+                except ConnectionError:
+                    pass
+                close_socket(upstream)
+                return
+    except (OSError, ValueError):
+        return
+
+
 class ChatTextFilter:
     """Hold a possible token prefix and suppress paths across delta boundaries."""
 
@@ -185,6 +205,11 @@ class ChatTextFilter:
         self.path_start = ""
         self.path_context = ""
         self.inside_path = False
+
+    def finish(self, interrupted=False):
+        if interrupted:
+            self.token_prefix = ""
+        return self.clean("", final=True)
 
     def clean(self, text, final=False):
         text = self.token_prefix + text
@@ -251,6 +276,7 @@ class WebUIServer(ThreadingMixIn, HTTPServer):
     def __init__(self, config):
         self.config = config
         self.slots = threading.BoundedSemaphore(MAX_CLIENTS)
+        self.image_slots = threading.BoundedSemaphore(MAX_IMAGE_CLIENTS)
         self.selector_key = secrets.token_bytes(32)
         self.models = {}
         if ":" in config.address:
@@ -417,17 +443,23 @@ class WebUIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "invalid_json")
         return value
 
-    def upstream(self, route, consume, payload=None):
+    def upstream(self, route, consume, payload=None, *, watch_disconnect=False):
         config = self.server.config
         url = urlsplit(config.upstream)
         connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
         connection = connection_type(url.hostname, url.port, timeout=IO_TIMEOUT)
         deadline = None
+        finished = threading.Event() if watch_disconnect else None
         try:
             connection.connect()
             deadline = threading.Timer(REQUEST_TIMEOUT, close_socket, args=(connection.sock,))
             deadline.daemon = True
             deadline.start()
+            if finished is not None:
+                threading.Thread(
+                    target=cancel_on_disconnect, args=(self.connection, connection.sock, finished),
+                    daemon=True,
+                ).start()
             headers = {"Authorization": f"Bearer {config.token}"}
             body = None
             if payload is not None:
@@ -447,6 +479,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
         except (OSError, http.client.HTTPException, ValueError, RecursionError):
             raise APIError(502, "invalid_upstream_response") from None
         finally:
+            if finished is not None:
+                finished.set()
             if deadline:
                 deadline.cancel()
             connection.close()
@@ -494,6 +528,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
         self.upstream(
             "/v1/chat/completions", self.stream_chat,
             {"model": model, "messages": clean_messages, "stream": True},
+            # A TCP FIN can also mean the client has only closed its write side.
+            watch_disconnect=self.headers.get("X-ATC-Cancel-On-Disconnect") == "1",
         )
 
     def send_event(self, event, data):
@@ -505,18 +541,21 @@ class WebUIHandler(BaseHTTPRequestHandler):
         if media_type != "text/event-stream":
             raise APIError(502, "invalid_upstream_response")
         self.send_headers(200, "text/event-stream; charset=utf-8")
+        text_filter = ChatTextFilter(self.server.config.token)
         try:
-            self.relay_chat(response)
+            self.relay_chat(response, text_filter)
         except (OSError, http.client.HTTPException, ValueError, RecursionError):
             try:
+                remaining = text_filter.finish(interrupted=True)
+                if remaining:
+                    self.send_event("delta", {"text": remaining})
                 self.send_event("error", {"error": "stream_interrupted"})
             except OSError:
                 pass
 
-    def relay_chat(self, response):
+    def relay_chat(self, response, text_filter):
         total = 0
         event_data = []
-        text_filter = ChatTextFilter(self.server.config.token)
         while True:
             line = response.readline(MAX_STREAM_LINE + 1)
             total += len(line)
@@ -530,7 +569,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             data = b"\n".join(event_data)
             event_data.clear()
             if data == b"[DONE]":
-                remaining = text_filter.clean("", final=True)
+                remaining = text_filter.finish()
                 if remaining:
                     self.send_event("delta", {"text": remaining})
                 self.send_event("done", {})
@@ -556,6 +595,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise APIError(400, "invalid_prompt")
+        if not self.server.image_slots.acquire(blocking=False):
+            raise APIError(503, "image_busy")
+        try:
+            self.send_image(model, prompt)
+        finally:
+            self.server.image_slots.release()
+
+    def send_image(self, model, prompt):
         data = self.upstream(
             "/v1/images/generations",
             lambda response: self.upstream_json(response, MAX_IMAGE),

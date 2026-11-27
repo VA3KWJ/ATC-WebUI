@@ -15,6 +15,17 @@ The WebUI targets Atomic Server 0.2.21 with Atomic Core 0.24.8. The installed ve
 - `POST /v1/chat/completions` is declared as the chat completion endpoint.
 - Successful responses from `POST /v1/images/generations` are specified to contain base64-encoded image data.
 
+## WebUI request behavior
+
+- Browser chat requests send `X-ATC-Cancel-On-Disconnect: 1` to the WebUI. When the browser disconnects, the WebUI closes its upstream connection and releases its request slot. Direct callers use their existing connection behavior by default.
+- An interrupted chat stream emits any safe buffered text before its `stream_interrupted` event. The browser retains the partial reply.
+- The WebUI allows two concurrent image generation requests within its 16-connection limit. When both image slots are occupied, additional image requests receive HTTP `503` with `{"error":"image_busy"}`. Chat can use the other slots.
+
+## Regression verification
+
+- All 19 Python tests passed with the local mock API, including disconnect cancellation, interrupted text, and image capacity and recovery.
+- All four JavaScript tests passed under Node.js 22 in a simulated browser environment. They cover independent saves from multiple tabs, existing history, oversized requests, and retrying failed storage writes.
+
 ## Stage 4 verification with a mock Atomic API
 
 - `python3 -m unittest discover -s tests -v` passed all 16 tests on Ubuntu 26.04 with Python 3.14 and in an isolated Ubuntu 24.04 container with Python 3.12. Coverage includes bearer authentication, token configuration and filtering, discovery, incremental and interrupted chat, image responses, upstream errors, redirects, route isolation, and resource limits.

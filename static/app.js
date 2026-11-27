@@ -4,6 +4,9 @@ const elements = Object.fromEntries(
   Array.from(document.querySelectorAll("[id]"), (element) => [element.id, element]),
 );
 const HISTORY_KEY = "atomic-webui.history.v1";
+const TURN_PREFIX = "atomic-webui.turn.";
+const ACTIVE_KEY = "atomic-webui.active";
+const pendingHistoryWrites = new Map();
 const THEME_KEY = "atomic-webui.theme";
 const MAX_CHAT_REQUEST = 256 * 1024;
 const encoder = new TextEncoder();
@@ -24,6 +27,7 @@ const errors = {
   upstream_route_unsupported: "This operation is unsupported by the Atomic API.",
   model_unavailable: "The selected model is unavailable. Refresh models and choose another.",
   image_model_unavailable: "Image generation has no configured model.",
+  image_busy: "The server is already generating images. Try again shortly.",
   invalid_prompt: "Enter an image prompt.",
   invalid_messages: "The conversation could not be sent. Start a new conversation and try again.",
   request_too_large: "The request is too large. Shorten your message and try again.",
@@ -65,33 +69,86 @@ function writeStorage(key, value) {
 
 function loadHistory() {
   const saved = readStorage(HISTORY_KEY);
-  if (!saved) return;
+  let legacyActiveId = null;
+  if (saved) {
+    try {
+      const history = JSON.parse(saved);
+      if (!Array.isArray(history.conversations)) throw new Error();
+      state.conversations = history.conversations.filter((conversation) =>
+        conversation && typeof conversation.id === "string" && validMessages(conversation.messages),
+      );
+      legacyActiveId = history.activeId;
+    } catch {
+      feedback("storage-status", "Saved conversations could not be loaded.");
+    }
+  }
   try {
-    const history = JSON.parse(saved);
-    if (!Array.isArray(history.conversations)) throw new Error();
-    state.conversations = history.conversations.filter((conversation) =>
-      conversation && typeof conversation.id === "string" &&
-      Array.isArray(conversation.messages) && conversation.messages.length &&
-      conversation.messages.every((message) =>
-        message && ["user", "assistant"].includes(message.role) &&
-        typeof message.content === "string",
-      ),
-    );
-    state.activeId = state.conversations.some(({ id }) => id === history.activeId)
-      ? history.activeId : null;
+    const conversations = new Map(state.conversations.map((conversation) => [conversation.id, conversation]));
+    const newConversations = [];
+    const keys = Object.keys(localStorage).filter((key) => key.startsWith(TURN_PREFIX)).sort();
+    for (const key of keys) {
+      try {
+        const turn = JSON.parse(localStorage.getItem(key));
+        if (!turn || typeof turn.id !== "string" || !validMessages(turn.messages)) continue;
+        let conversation = conversations.get(turn.id);
+        if (!conversation) {
+          conversation = { id: turn.id, messages: [] };
+          conversations.set(turn.id, conversation);
+          newConversations.push(conversation);
+        }
+        conversation.messages.push(...turn.messages);
+      } catch {
+        feedback("storage-status", "Some saved messages could not be loaded.");
+      }
+    }
+    state.conversations = [...newConversations.reverse(), ...state.conversations];
+    const activeId = localStorage.getItem(ACTIVE_KEY) ?? legacyActiveId;
+    state.activeId = conversations.has(activeId) ? activeId : null;
   } catch {
     feedback("storage-status", "Saved conversations could not be loaded.");
   }
 }
 
-function saveHistory() {
-  const conversations = state.conversations.map(({ id, messages }) => ({
-    id,
-    messages: messages.map(({ role, content }) => ({ role, content })),
-  }));
-  if (writeStorage(HISTORY_KEY, JSON.stringify({ conversations, activeId: state.activeId }))) {
-    feedback("storage-status", "");
+function validMessages(messages) {
+  return Array.isArray(messages) && messages.length > 0 && messages.every((message) =>
+    message && ["user", "assistant"].includes(message.role) && typeof message.content === "string",
+  );
+}
+
+function randomId() {
+  // getRandomValues also works when the UI is served over plain HTTP.
+  return Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) =>
+    part.toString(16).padStart(8, "0"),
+  ).join("");
+}
+
+let lastTurnTime = 0;
+
+function newTurnKey() {
+  lastTurnTime = Math.max(Date.now(), lastTurnTime + 1);
+  return TURN_PREFIX + String(lastTurnTime).padStart(16, "0") + "." + randomId();
+}
+
+function saveTurn(key, id, messages) {
+  saveHistoryEntry(key, JSON.stringify({ id, messages }));
+}
+
+function saveHistoryEntry(key, value) {
+  pendingHistoryWrites.set(key, value);
+  for (const [entry, pending] of pendingHistoryWrites) {
+    try {
+      if (pending === null) localStorage.removeItem(entry);
+      else localStorage.setItem(entry, pending);
+      pendingHistoryWrites.delete(entry);
+    } catch {
+      // Retry pending entries the next time history is saved.
+    }
   }
+  feedback("storage-status", pendingHistoryWrites.size ? "Could not save changes to browser storage." : "");
+}
+
+function saveActiveConversation() {
+  saveHistoryEntry(ACTIVE_KEY, state.activeId ?? "");
 }
 
 function currentConversation() {
@@ -118,7 +175,7 @@ function renderHistory() {
       state.activeId = conversation.id;
       elements["chat-prompt"].value = "";
       feedback("chat-status", "");
-      saveHistory();
+      saveActiveConversation();
       showView("chat");
       renderConversation();
       renderHistory();
@@ -261,12 +318,12 @@ async function loadImageConfig() {
   }
 }
 
-function postJson(path, payload, signal) {
+function postJson(path, payload, options) {
   return request(path, {
+    ...options,
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...options?.headers },
     body: JSON.stringify(payload),
-    signal,
   });
 }
 
@@ -340,13 +397,13 @@ async function submitChat(event) {
     return;
   }
   elements["chat-prompt"].readOnly = true;
-  if (!conversation) {
-    // getRandomValues also works when the UI is served over plain HTTP.
-    const id = Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) => part.toString(16).padStart(8, "0")).join("");
-    conversation = { id, messages: [] };
+  const isNewConversation = !conversation;
+  if (isNewConversation) {
+    conversation = { id: randomId(), messages: [] };
     state.conversations.unshift(conversation);
     state.activeId = conversation.id;
   }
+  const turnKey = newTurnKey();
   conversation.messages.push(message);
   const controller = new AbortController();
   state.chatRequest = controller;
@@ -355,12 +412,14 @@ async function submitChat(event) {
   renderConversation();
   renderHistory();
   updateControls();
-  saveHistory();
+  saveTurn(turnKey, conversation.id, [message]);
+  if (isNewConversation) saveActiveConversation();
 
   let reply = "";
   let paragraph;
   let painted = 0;
   let animationFrame = null;
+  let rejected = false;
   function paintReply() {
     animationFrame = null;
     if (painted === reply.length) return;
@@ -373,7 +432,10 @@ async function submitChat(event) {
   }
 
   try {
-    const response = await postJson("/api/chat", payload, controller.signal);
+    const response = await postJson("/api/chat", payload, {
+      signal: controller.signal,
+      headers: { "X-ATC-Cancel-On-Disconnect": "1" },
+    });
     await readChat(response, (delta) => {
       if (!reply && delta) feedback("chat-status", "Receiving reply…");
       reply += delta;
@@ -382,10 +444,15 @@ async function submitChat(event) {
     feedback("chat-status", reply ? "Reply complete." : "The model returned an empty reply.");
   } catch (error) {
     if (error.status === 413) {
+      rejected = true;
       conversation.messages.pop();
+      saveHistoryEntry(turnKey, null);
       if (!conversation.messages.length) {
         state.conversations = state.conversations.filter(({ id }) => id !== conversation.id);
         state.activeId = null;
+        if ((pendingHistoryWrites.get(ACTIVE_KEY) ?? readStorage(ACTIVE_KEY)) === conversation.id) {
+          saveActiveConversation();
+        }
       }
       elements["chat-prompt"].value = prompt;
       renderConversation();
@@ -395,10 +462,17 @@ async function submitChat(event) {
   } finally {
     if (animationFrame !== null) cancelAnimationFrame(animationFrame);
     paintReply();
-    if (reply) conversation.messages.push({ role: "assistant", content: reply });
+    if (!rejected && (reply || pendingHistoryWrites.has(turnKey))) {
+      const turn = [message];
+      if (reply) {
+        const answer = { role: "assistant", content: reply };
+        conversation.messages.push(answer);
+        turn.push(answer);
+      }
+      saveTurn(turnKey, conversation.id, turn);
+    }
     state.chatRequest = null;
     elements["chat-prompt"].readOnly = false;
-    saveHistory();
     renderHistory();
     updateControls();
   }
@@ -465,7 +539,7 @@ elements["new-chat"].addEventListener("click", () => {
   state.activeId = null;
   elements["chat-prompt"].value = "";
   feedback("chat-status", "");
-  saveHistory();
+  saveActiveConversation();
   showView("chat");
   renderConversation();
   renderHistory();
