@@ -137,6 +137,8 @@ Hover over a gallery image or focus it with the keyboard to reveal **Save** and 
 
 Run WebUI and Atomic Server under the same account. Use Atomic Server 0.2.21, keep `ATC_API_URL` on loopback, and set `ATC_WEBUI_MODEL_CONTROL=1` in the launcher configuration or environment. For LAN access, configure the WebUI host and public origin as shown below. Model controls accept direct connections from private IPv4 and unique-local IPv6 addresses when the WebUI is bound for network access.
 
+The installer runs `command -v atc` and saves the absolute path as `ATC_WEBUI_ATC_BIN` in `config.sh` if a path was found and the setting is missing. Rerunning the installer preserves an existing selection. Without a configured path, the launcher checks its runtime `PATH`, `~/.local/bin/atc`, and `/usr/local/bin/atc`. Restart the WebUI after changing the setting.
+
 Use the loopback URL for `ATC_API_URL` even if Atomic reports a wildcard bind. For example, a listener at `0.0.0.0:1339` is reachable by the WebUI at `http://127.0.0.1:1339`.
 
 In **Models**, browse the Atomic catalog or search by name or Hugging Face repository ID. Chat search offers GGUF and the MLX or managed safetensors engines reported for the host. Image search covers Atomic catalog variants. Choose a variant, review its size and compatibility, then select **Download**. Atomic owns the job, and the **Downloads** list can show its progress after a page reload. Retrying the same confirmation after a request error reuses its request ID. Use Atomic Server's native controls to resume a job that reports a failed or interrupted state.

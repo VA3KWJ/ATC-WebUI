@@ -160,6 +160,7 @@ main() {
     fi
     select_python || fail "Python 3.10 or newer with SSL support is required. Install it and rerun this installer."
     command -v curl >/dev/null 2>&1 || fail "curl is required to download Atomic WebUI."
+    atomic_cli=$(command -v atc) || atomic_cli=
 
     umask 077
     work=$(mktemp -d)
@@ -169,9 +170,11 @@ main() {
         --location --connect-timeout 10 --max-time 120 --max-filesize 10485760 \
         "https://codeload.github.com/VA3KWJ/ATC-WebUI/tar.gz/$ref" -o "$work/source.tar.gz"
 
-    "$python" - "$work/source.tar.gz" "$python" "$service_manager" "$work/service" <<'PY'
+    "$python" - "$work/source.tar.gz" "$python" "$service_manager" "$work/service" "$atomic_cli" <<'PY'
+import fcntl
 import os
 import pwd
+import re
 import shlex
 import stat
 import sys
@@ -205,19 +208,41 @@ def install_directory(path):
     path.chmod(0o700)
 
 
+def private_file_info(file, path):
+    info = os.fstat(file.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        raise ValueError(f"Expected a regular file owned by the current user at {path}")
+
+
 def private_file(path, contents):
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(descriptor, "rb") as existing:
-            info = os.fstat(existing.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
-                raise ValueError(f"Expected a regular file owned by the current user at {path}")
+            private_file_info(existing, path)
             os.fchmod(existing.fileno(), 0o600)
     else:
         with os.fdopen(descriptor, "wb") as created:
             created.write(contents)
+
+
+def save_atomic_cli(settings, binary):
+    if not binary:
+        return
+    descriptor = os.open(settings, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "a+b") as config:
+        private_file_info(config, settings)
+        fcntl.flock(config, fcntl.LOCK_EX)
+        config.seek(0)
+        contents = config.read()
+        if re.search(rb"(?m)^[ \t]*(?:export[ \t]+)?ATC_WEBUI_ATC_BIN=", contents):
+            return
+        if contents and not contents.endswith(b"\n"):
+            config.write(b"\n")
+        # Respect shell-computed settings and values supplied by the caller.
+        assignment = f'if [ "${{ATC_WEBUI_ATC_BIN+x}}" != x ]; then\n    ATC_WEBUI_ATC_BIN={shlex.quote(binary)}\nfi\n'
+        config.write(os.fsencode(assignment))
 
 
 def replace_file(path, contents, mode):
@@ -238,6 +263,10 @@ def xdg_path(variable, default):
     if not path.is_absolute():
         raise ValueError(f"{variable} must be an absolute path")
     return path.resolve() / "atc-webui"
+
+
+def atomic_cli_fallbacks():
+    return shlex.join((str(Path.home() / ".local/bin/atc"), "/usr/local/bin/atc"))
 
 
 def systemd_quote(value):
@@ -377,7 +406,7 @@ esac
 """
 
 
-def install(archive_path, python, manager, service_path):
+def install(archive_path, python, manager, service_path, atomic_cli):
     python = os.path.abspath(python)
     if Path(archive_path).stat().st_size > 10 * 1024 * 1024:
         raise ValueError("Source archive exceeds 10 MiB")
@@ -414,13 +443,25 @@ def install(archive_path, python, manager, service_path):
         f"ATC_API_TOKEN_FILE={shlex.quote(str(token))}\n"
         "# ATC_WEBUI_PORT=8080\n"
     ).encode())
+    if atomic_cli and os.path.isfile(atomic_cli) and os.access(atomic_cli, os.X_OK):
+        save_atomic_cli(settings, os.path.abspath(atomic_cli))
 
     for name, contents in source.items():
         replace_file(data / name, contents, 0o600)
     launcher = (
         "#!/bin/sh\nset -eu\nset -a\n"
         f". {shlex.quote(str(settings))}\n"
-        f"set +a\nexec {shlex.quote(python)} {shlex.quote(str(data / 'server.py'))}\n"
+        "set +a\n"
+        'if [ "${ATC_WEBUI_MODEL_CONTROL:-}" = 1 ] && [ -z "${ATC_WEBUI_ATC_BIN:-}" ] &&\n'
+        "    ! command -v atc >/dev/null 2>&1; then\n"
+        f"    for candidate in {atomic_cli_fallbacks()}; do\n"
+        '        if [ -f "$candidate" ] && [ -x "$candidate" ]; then\n'
+        '            export ATC_WEBUI_ATC_BIN="$candidate"\n'
+        "            break\n"
+        "        fi\n"
+        "    done\n"
+        "fi\n"
+        f"exec {shlex.quote(python)} {shlex.quote(str(data / 'server.py'))}\n"
     )
     replace_file(data / "run", launcher.encode(), 0o700)
     print(f"Configuration: {settings}")
