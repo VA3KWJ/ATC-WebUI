@@ -2,6 +2,18 @@
 
 A lightweight browser interface for an existing Atomic Server public API. It provides streaming text chat, model selection, browser-local conversation history, light and dark themes, and an optional image generator and gallery link. The WebUI uses Python 3.10+ and the standard library.
 
+## Screenshots
+
+Captured with a local mock API and sample content.
+
+### Chat in dark mode
+
+![Dark mode Chat view with conversation history, a model selector, and a completed reply](docs/screenshots/chat-dark.png)
+
+### Images in light mode
+
+![Light mode Images view with an image prompt, a mountain lake preview, and a gallery link](docs/screenshots/images-light.png)
+
 ## One-shot install
 
 Run this as the user who will run the WebUI.
