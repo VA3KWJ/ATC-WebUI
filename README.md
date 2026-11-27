@@ -72,7 +72,7 @@ python3 server.py
 | `ATC_API_TOKEN` | Optional alternative | Supply the bearer token through the service environment. Set exactly one token source. |
 | `ATC_WEBUI_HOST` | `127.0.0.1` | WebUI bind address. |
 | `ATC_WEBUI_PORT` | `8080` | WebUI listen port. |
-| `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Set this for a reverse proxy or wildcard bind. |
+| `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Required for a wildcard bind. Set this when using a reverse proxy. |
 | `ATC_WEBUI_IMAGE_MODEL` | Unset | Atomic image model identifier. An empty value disables image generation. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
@@ -95,6 +95,15 @@ location / {
     proxy_read_timeout 190s;
 }
 ```
+
+For direct access on a trusted LAN, add both settings to `~/.config/atc-webui/config.sh` and restart the launcher. Replace `192.168.1.10` with the WebUI machine's LAN address and use the configured listen port in the URL.
+
+```sh
+ATC_WEBUI_HOST="0.0.0.0"
+ATC_WEBUI_PUBLIC_ORIGIN="http://192.168.1.10:8080"
+```
+
+Open the URL configured in `ATC_WEBUI_PUBLIC_ORIGIN`. The WebUI checks requests against that origin. Restrict direct access to trusted clients, since they can use the WebUI to make requests with its upstream API token.
 
 ## Validation
 

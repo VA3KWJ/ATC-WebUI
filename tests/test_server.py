@@ -149,6 +149,14 @@ class ConfigTests(unittest.TestCase):
             stderr.write.assert_any_call("Invalid WebUI configuration.")
             self.assertNotIn("invalid secret", repr(stderr.mock_calls))
 
+    def test_wildcard_startup_error_names_required_origin(self):
+        env = self.env | {"ATC_API_TOKEN": TOKEN, "ATC_WEBUI_HOST": "0.0.0.0"}
+        with patch.dict(os.environ, env, clear=True), patch("sys.stderr") as stderr:
+            self.assertEqual(server.main(), 1)
+            stderr.write.assert_any_call(
+                "Set ATC_WEBUI_PUBLIC_ORIGIN when using a wildcard bind address."
+            )
+
 
 class ChatFilterTests(unittest.TestCase):
     def test_filter_handles_any_chunk_boundary_without_stripping_common_slashes(self):

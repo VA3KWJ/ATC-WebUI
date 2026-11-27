@@ -156,7 +156,7 @@ class Config:
                     raise ConfigurationError
                 public_origin = origin(parsed_origin)
             if address in {"0.0.0.0", "::"} and not public_origin:
-                raise ConfigurationError
+                raise ConfigurationError("Set ATC_WEBUI_PUBLIC_ORIGIN when using a wildcard bind address.")
             gallery = env.get("ATC_WEBUI_GALLERY_URL") or None
             if gallery:
                 parse_url(gallery)
@@ -167,6 +167,8 @@ class Config:
                 address, port, origin(upstream), public_origin,
                 env.get("ATC_WEBUI_IMAGE_MODEL", ""), gallery, token,
             )
+        except ConfigurationError:
+            raise
         except (OSError, KeyError, ValueError, OverflowError):
             raise ConfigurationError from None
 
@@ -634,8 +636,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
 def main():
     try:
         config = Config.from_env(os.environ)
-    except ConfigurationError:
-        print("Invalid WebUI configuration.", file=sys.stderr)
+    except ConfigurationError as error:
+        print(str(error) or "Invalid WebUI configuration.", file=sys.stderr)
         return 1
     try:
         with WebUIServer(config) as server:
