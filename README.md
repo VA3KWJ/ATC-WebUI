@@ -86,19 +86,23 @@ python3 server.py
 | `ATC_WEBUI_PORT` | `8080` | WebUI listen port. |
 | `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Required for a wildcard bind. Set this when using a reverse proxy. |
 | `ATC_WEBUI_IMAGE_MODEL` | Unset | Use the currently loaded Atomic image model when unset. Set an identifier to request a specific model, or set an empty value to disable image generation. |
-| `ATC_WEBUI_CONTROL_DATA_DIR` | Unset | Absolute Atomic Server data directory on the same machine. Enables live image progress when `ATC_WEBUI_IMAGE_MODEL` is unset. |
+| `ATC_WEBUI_CONTROL_DATA_DIR` | Unset | Absolute path to the local Atomic Server data directory. Enables the sidebar's local image model status and, with automatic model selection, live generation progress. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
 
-### Live image progress
+### Local image model status and progress
 
-To show the running image model in the sidebar, plus sampling steps and Atomic’s time estimate during generation, run the WebUI as the same OS user as Atomic Server and add this setting to the WebUI configuration. Use your actual Atomic data directory if you moved it.
+Run the WebUI on the same machine and as the same OS user as Atomic Server. For a launcher installation, add this line to `~/.config/atc-webui/config.sh`, or use the corresponding file under `$XDG_CONFIG_HOME`. For a manual launch or service, set the variable in the environment that starts `server.py`.
 
 ```sh
 ATC_WEBUI_CONTROL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/atomic-chat-cli/data"
 ```
 
-Restart the WebUI after updating its settings. The backend uses that directory to find the loopback control listener and its owner-only token. Use a data directory controlled by the Atomic Server account. The backend reads the requested job’s progress and a preview of its completed gallery image. Keep the Atomic control listener bound to loopback. Explicit image model overrides and clients requesting the binary response use the public API. If you use a reverse proxy, disable response buffering for image progress as well as chat.
+If Atomic Server uses a custom data directory, use that absolute path. It should contain `atc/run/daemon.json` and `atomic-core/control-token`. The WebUI reads these files to connect to Atomic's loopback control listener. Keep the token readable only by the Atomic Server account and keep the listener bound to loopback.
+
+Restart the WebUI after saving the setting. The **Local image model** row refreshes every 10 seconds while the tab is visible. It shows **Running** and the model name when an image model is loaded. If it shows **Status unavailable** while the public API is available, check that the running WebUI received the setting and can read the two files under the configured directory. Public API image generation can still work when local model status is unavailable.
+
+Leave `ATC_WEBUI_IMAGE_MODEL` unset to use the loaded local model and see live sampling steps and Atomic's estimated time remaining. An explicit image model override uses the public API and shows elapsed time during generation. If you use a reverse proxy, disable response buffering for image progress as well as chat.
 
 ## Network access
 
