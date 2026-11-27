@@ -26,7 +26,8 @@ const errors = {
   upstream_authentication_failed: "The Atomic API rejected its credentials. Contact the operator.",
   upstream_route_unsupported: "This operation is unsupported by the Atomic API.",
   model_unavailable: "The selected model is unavailable. Refresh models and choose another.",
-  image_model_unavailable: "Image generation has no configured model.",
+  image_model_unavailable: "Image generation is disabled in the WebUI configuration.",
+  image_model_not_loaded: "The requested image model is unavailable. Load it in Atomic Server and try again.",
   image_busy: "The server is already generating images. Try again shortly.",
   invalid_prompt: "Enter an image prompt.",
   invalid_messages: "The conversation could not be sent. Start a new conversation and try again.",
@@ -310,7 +311,7 @@ async function loadImageConfig() {
         elements.gallery.hidden = true;
       }
     }
-    feedback("image-status", state.imageEnabled ? "" : "Image generation has no configured model.");
+    feedback("image-status", state.imageEnabled ? "" : errors.image_model_unavailable);
   } catch (error) {
     feedback("image-status", error.message, "error");
   } finally {

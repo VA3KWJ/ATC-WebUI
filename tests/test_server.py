@@ -20,6 +20,7 @@ import server
 
 TOKEN = "mock-secret-2Y5JpHlw"
 MODEL = "/private/atomic/models/example.gguf"
+IMAGE_MODEL = "/private/image-model"
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRuoAAAAASUVORK5CYII="
 )
@@ -102,6 +103,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.token, TOKEN)
         self.assertNotIn(TOKEN, repr(config))
         self.assertEqual(config.address, "127.0.0.1")
+        self.assertIsNone(config.image_model)
 
     def test_token_file_must_be_readable_regular_and_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -186,7 +188,7 @@ class WebUITests(unittest.TestCase):
         config = server.Config.from_env({
             "ATC_API_URL": f"http://127.0.0.1:{self.upstream.server_port}",
             "ATC_API_TOKEN": TOKEN,
-            "ATC_WEBUI_IMAGE_MODEL": "/private/image-model",
+            "ATC_WEBUI_IMAGE_MODEL": IMAGE_MODEL,
             "ATC_WEBUI_GALLERY_URL": "https://gallery.example.test/",
         })
         resources.enter_context(patch.object(server, "MAX_CLIENTS", 3))
@@ -365,6 +367,36 @@ class WebUITests(unittest.TestCase):
                 "gallery_url": "https://gallery.example.test/", "image_enabled": True,
             })
 
+    def test_image_uses_loaded_model_when_no_override_is_set(self):
+        payload = {"prompt": "draw", "n": 1, "response_format": "b64_json"}
+        with patch.object(self.ui, "config", replace(self.ui.config, image_model=None)):
+            with self.response("/api/config") as response:
+                self.assertTrue(json.load(response)["image_enabled"])
+            self.assertTrue(self.upstream.calls.empty())
+
+            self.upstream.enqueue(503, {
+                "error": {"code": "model_not_loaded", "message": IMAGE_MODEL},
+            })
+            with self.response("/api/images", {"prompt": "draw"}) as response:
+                self.assertEqual(response.status, 503)
+                self.assertEqual(json.load(response), {"error": "image_model_not_loaded"})
+            self.expect_call("POST", "/v1/images/generations", payload)
+
+            self.upstream.enqueue(200, {"data": [{"b64_json": base64.b64encode(PNG).decode()}]})
+            with self.response("/api/images", {"prompt": "draw"}) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), PNG)
+            self.expect_call("POST", "/v1/images/generations", payload)
+
+    def test_explicit_empty_image_model_disables_generation(self):
+        with patch.object(self.ui, "config", replace(self.ui.config, image_model="")):
+            with self.response("/api/config") as response:
+                self.assertFalse(json.load(response)["image_enabled"])
+            with self.response("/api/images", {"prompt": "draw"}) as response:
+                self.assertEqual(response.status, 400)
+                self.assertEqual(json.load(response), {"error": "image_model_unavailable"})
+        self.assertTrue(self.upstream.calls.empty())
+
     def test_image_limit_leaves_room_for_chat_and_releases_after_completion(self):
         selector = self.discover()
         resume = threading.Event()
@@ -400,10 +432,11 @@ class WebUITests(unittest.TestCase):
             for connection in images:
                 with connection.getresponse() as response:
                     self.assertEqual(response.read(), PNG)
-        for _ in range(server.MAX_IMAGE_CLIENTS):
-            self.upstream.enqueue(500, {})
+        for status in (500, 503):
+            self.upstream.enqueue(status, {})
             with self.response("/api/images", {"prompt": "draw"}) as response:
                 self.assertEqual(response.status, 502)
+                self.assertEqual(json.load(response), {"error": "upstream_request_failed"})
             self.expect_call("POST", "/v1/images/generations", image_payload)
         self.upstream.enqueue(200, image)
         with self.response("/api/images", {"prompt": "draw"}) as response:

@@ -1,9 +1,9 @@
 """Same-origin WebUI server for the Atomic Server public API.
 
 GET /api/models returns opaque model IDs and labels. GET /api/config returns
-the gallery URL and image availability. POST /api/chat accepts a model ID and
-messages and emits delta, done, and error SSE events. POST /api/images takes
-a prompt and returns one image as binary data.
+the gallery URL and whether image generation is enabled. POST /api/chat
+accepts a model ID and messages and emits delta, done, and error SSE events.
+POST /api/images takes a prompt and returns one image as binary data.
 
 Set ATC_API_URL to the upstream origin and choose ATC_API_TOKEN or
 ATC_API_TOKEN_FILE. Prefer a mode 0600 file outside the checkout owned by the
@@ -133,7 +133,7 @@ class Config:
     port: int
     upstream: str
     public_origin: str | None
-    image_model: str
+    image_model: str | None
     gallery_url: str | None
     token: str = field(repr=False)
 
@@ -165,7 +165,7 @@ class Config:
                 raise ConfigurationError
             return cls(
                 address, port, origin(upstream), public_origin,
-                env.get("ATC_WEBUI_IMAGE_MODEL", ""), gallery, token,
+                env.get("ATC_WEBUI_IMAGE_MODEL"), gallery, token,
             )
         except ConfigurationError:
             raise
@@ -406,7 +406,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/config":
                 self.send_json(200, {
                     "gallery_url": self.server.config.gallery_url,
-                    "image_enabled": bool(self.server.config.image_model),
+                    "image_enabled": self.server.config.image_model != "",
                 })
             elif self.path in STATIC_ROUTES:
                 filename, media_type = STATIC_ROUTES[self.path]
@@ -473,6 +473,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     raise APIError(502, "upstream_authentication_failed")
                 if response.status in {404, 405, 501}:
                     raise APIError(502, "upstream_route_unsupported")
+                if response.status == 503 and route == "/v1/images/generations":
+                    self.raise_if_image_model_unavailable(response)
                 if response.status != 200:
                     raise APIError(502, "upstream_request_failed")
                 return consume(response)
@@ -495,6 +497,15 @@ class WebUIHandler(BaseHTTPRequestHandler):
         if response.length not in {None, 0}:
             raise APIError(502, "invalid_upstream_response")
         return json.loads(body.decode("utf-8"))
+
+    def raise_if_image_model_unavailable(self, response):
+        try:
+            data = self.upstream_json(response, MAX_STREAM_LINE)
+        except (APIError, ValueError, RecursionError):
+            return
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict) and error.get("code") == "model_not_loaded":
+            raise APIError(503, "image_model_not_loaded")
 
     def discover_models(self):
         data = self.upstream(
@@ -592,7 +603,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
     def generate_image(self, payload):
         model = self.server.config.image_model
-        if not model:
+        if model == "":
             raise APIError(400, "image_model_unavailable")
         prompt = payload.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -605,10 +616,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self.server.image_slots.release()
 
     def send_image(self, model, prompt):
+        payload = {"prompt": prompt, "n": 1, "response_format": "b64_json"}
+        if model is not None:
+            payload["model"] = model
         data = self.upstream(
             "/v1/images/generations",
             lambda response: self.upstream_json(response, MAX_IMAGE),
-            {"model": model, "prompt": prompt, "n": 1, "response_format": "b64_json"},
+            payload,
         )
         images = data.get("data") if isinstance(data, dict) else None
         image = images[0] if isinstance(images, list) and images else None

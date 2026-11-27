@@ -53,7 +53,7 @@ curl -fsSLo atc-webui-install.sh "https://raw.githubusercontent.com/VA3KWJ/ATC-W
 
 The launcher runs in the foreground. Press Ctrl+C to stop it. To rotate the token, replace the configured token file with the new token, retain ownership and mode `0600`, and restart the WebUI. The empty installation placeholder must be populated before startup.
 
-If the API is reachable and no models are listed, make a suitable model available through Atomic Server and select **Refresh models**. Use the **Images** view after setting `ATC_WEBUI_IMAGE_MODEL`. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
+If the API is reachable and no chat models are listed, make a suitable chat model available through Atomic Server and select **Refresh models**. In the **Images** view, generation uses the image model currently loaded in Atomic Server by default. The public API reports image model availability when you submit a prompt. If the model is unavailable, load it in Atomic Server and submit again. Conversations and theme choices are stored in the current browser. A generated image preview lasts for the current page session.
 
 Select **Stop** to end a streaming reply. Text already received stays in the conversation, including when the upstream stream is interrupted. Multiple tabs can save turns independently. Reload a tab to see turns saved in another tab. Existing browser history loads automatically.
 
@@ -85,7 +85,7 @@ python3 server.py
 | `ATC_WEBUI_HOST` | `127.0.0.1` | WebUI bind address. |
 | `ATC_WEBUI_PORT` | `8080` | WebUI listen port. |
 | `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Required for a wildcard bind. Set this when using a reverse proxy. |
-| `ATC_WEBUI_IMAGE_MODEL` | Unset | Atomic image model identifier. An empty value disables image generation. |
+| `ATC_WEBUI_IMAGE_MODEL` | Unset | Use the currently loaded Atomic image model when unset. Set an identifier to request a specific model, or set an empty value to disable image generation. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
 
