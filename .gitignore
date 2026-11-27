@@ -24,3 +24,6 @@ images/
 
 # OS files
 .DS_Store
+
+# Codex
+.codex/
