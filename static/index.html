@@ -22,6 +22,7 @@
       <div class="navigation">
         <button id="chat-view" type="button" aria-pressed="true">Chat</button>
         <button id="image-view" type="button" aria-pressed="false">Images</button>
+        <button id="models-view" type="button" aria-pressed="false" hidden>Models</button>
       </div>
       <div class="history-heading">
         <h2>Conversations</h2>
@@ -105,6 +106,51 @@
         </section>
       </section>
       <p id="storage-status" class="storage-status" role="status"></p>
+      <section id="models-panel" class="panel" aria-labelledby="models-title" hidden>
+        <header class="panel-heading"><h1 id="models-title">Models</h1></header>
+        <div class="model-management">
+          <form id="model-search" class="composer">
+            <h2>Available for download</h2>
+            <label for="model-category">Model type</label>
+            <select id="model-category"><option value="text">Chat</option><option value="image">Image</option></select>
+            <label for="model-provider" id="model-provider-label">Chat engine</label>
+            <select id="model-provider"></select>
+            <label for="model-query">Model name or Hugging Face repository</label>
+            <input id="model-query" type="search" maxlength="160">
+            <div class="actions">
+              <button type="submit">Search</button>
+              <button id="model-catalog" type="button" class="secondary">Browse catalog</button>
+            </div>
+          </form>
+          <div class="composer">
+            <label for="download-model">Model</label>
+            <select id="download-model" disabled></select>
+            <label for="download-variant">Variant</label>
+            <select id="download-variant" disabled></select>
+            <div class="actions">
+              <button id="review-download" type="button" disabled>Review download</button>
+              <button id="start-download" type="button" disabled hidden>Download</button>
+            </div>
+            <p id="download-review" class="feedback" role="status"></p>
+          </div>
+          <div class="composer">
+            <h2>Installed models</h2>
+            <label for="installed-model">Model to load</label>
+            <select id="installed-model" disabled></select>
+            <div class="actions">
+              <button id="load-model" type="button" aria-describedby="load-model-note" disabled>Load model</button>
+              <button id="refresh-installed" type="button" class="secondary">Refresh installed models</button>
+            </div>
+            <p id="load-model-note" class="muted">Loading can replace a model on the same device.</p>
+            <p id="load-model-status" class="feedback" role="status"></p>
+          </div>
+          <div class="composer">
+            <h2>Downloads</h2>
+            <ul id="model-downloads"></ul>
+            <p id="model-jobs-status" class="feedback" role="status"></p>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </body>

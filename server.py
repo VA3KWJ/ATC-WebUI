@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import TCPServer, ThreadingMixIn
 from urllib.parse import urlsplit
+from model_control import ControlError, ModelControl
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_ROUTES = {
@@ -140,6 +141,20 @@ def is_loopback(host):
         return False
 
 
+MODEL_CONTROL_LAN = tuple(map(ipaddress.ip_network, (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+)))
+
+
+def model_control_peer(host, lan_enabled):
+    address = ipaddress.ip_address(host)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback or (
+        lan_enabled and any(address in network for network in MODEL_CONTROL_LAN)
+    )
+
+
 def origin(url):
     host = url.hostname
     if ":" in host:
@@ -160,6 +175,9 @@ class Config:
     token: str = field(repr=False)
     control_data_dir: Path | None = None
     gallery_dir: Path | None = None
+    model_control: bool = False
+    atc_binary: str = "atc"
+    atc_data_folder: Path | None = None
 
     @classmethod
     def from_env(cls, env):
@@ -193,11 +211,28 @@ class Config:
             gallery_dir = env.get("ATC_WEBUI_GALLERY_DIR")
             if gallery_dir and not Path(gallery_dir).is_absolute():
                 raise ConfigurationError("Set ATC_WEBUI_GALLERY_DIR to an absolute path.")
+            model_control = env.get("ATC_WEBUI_MODEL_CONTROL") == "1"
+            atc_binary = env.get("ATC_WEBUI_ATC_BIN") or "atc"
+            atc_data = env.get("ATC_WEBUI_ATC_DATA_FOLDER")
+            if model_control and (
+                not is_loopback(upstream.hostname)
+                or bool(public_origin) == is_loopback(address)
+            ):
+                raise ConfigurationError(
+                    "Model controls require a local Atomic API and either a loopback WebUI "
+                    "without a public origin or a LAN WebUI with an explicit origin."
+                )
+            if model_control and (
+                (atc_binary != "atc" and not Path(atc_binary).is_absolute())
+                or (atc_data and not Path(atc_data).is_absolute())
+            ):
+                raise ConfigurationError("Set ATC CLI and data-folder overrides to absolute paths.")
             return cls(
                 address, port, origin(upstream), public_origin,
                 env.get("ATC_WEBUI_IMAGE_MODEL"), gallery, token,
                 Path(control_dir) if control_dir else None,
                 Path(gallery_dir) if gallery_dir else None,
+                model_control, atc_binary, Path(atc_data) if atc_data else None,
             )
         except ConfigurationError:
             raise
@@ -458,6 +493,10 @@ class WebUIServer(ThreadingMixIn, HTTPServer):
 
     def __init__(self, config):
         self.config = config
+        self.model_control = (
+            ModelControl(config.atc_binary, config.atc_data_folder, config.upstream, config.token)
+            if config.model_control else None
+        )
         self.slots = threading.BoundedSemaphore(MAX_CLIENTS)
         self.image_slots = threading.BoundedSemaphore(MAX_IMAGE_CLIENTS)
         self.gallery_slots = threading.BoundedSemaphore(MAX_GALLERY_CLIENTS)
@@ -596,7 +635,11 @@ class WebUIHandler(BaseHTTPRequestHandler):
             gallery_list = not write and path == "/api/gallery"
             gallery_image = None if separator else GALLERY_IMAGE_ROUTE.fullmatch(path)
             self.check_origin(write or gallery_list or gallery_image is not None)
-            if self.command == "DELETE":
+            if path.startswith("/api/model-control/"):
+                if separator:
+                    raise APIError(404, "route_not_found")
+                self.manage_models(path.removeprefix("/api/model-control/"), write)
+            elif self.command == "DELETE":
                 if not gallery_image or gallery_image[2]:
                     raise APIError(404, "route_not_found")
                 self.delete_gallery_image(gallery_image[1])
@@ -616,6 +659,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     "gallery_url": self.server.config.gallery_url,
                     "gallery_enabled": self.server.config.gallery_dir is not None,
                     "image_enabled": self.server.config.image_model != "",
+                    "model_control_enabled": self.model_control_allowed(),
                 })
             elif gallery_list:
                 self.list_gallery(query if separator else None)
@@ -631,13 +675,33 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             else:
                 raise APIError(404, "route_not_found")
-        except APIError as error:
+        except (APIError, ControlError) as error:
             try:
                 self.send_json(error.status, {"error": error.code})
             except (ConnectionError, TimeoutError):
                 return
         except (ConnectionError, TimeoutError):
             return
+
+    def model_control_allowed(self):
+        config = self.server.config
+        lan_enabled = bool(config.public_origin) and not is_loopback(config.address)
+        return (
+            self.server.model_control is not None
+            and model_control_peer(self.client_address[0], lan_enabled)
+            and not any(name.lower() == "forwarded" or name.lower().startswith("x-forwarded-")
+                        or name.lower() in {"via", "x-real-ip"} for name in self.headers)
+        )
+
+    def manage_models(self, route, write):
+        if not self.model_control_allowed():
+            raise APIError(404, "route_not_found")
+        self.check_origin(True)
+        if write and not self.headers.get("Origin"):
+            raise APIError(403, "origin_forbidden")
+        payload = self.read_json() if self.command == "POST" else {}
+        response = self.server.model_control.dispatch(route, self.command, payload)
+        self.send_json(200, response)
 
     @contextmanager
     def open_gallery(self):

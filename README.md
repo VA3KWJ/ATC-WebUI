@@ -1,6 +1,6 @@
 # Atomic Server WebUI
 
-A lightweight browser interface for an existing Atomic Server public API. It provides streaming text chat, model selection, browser-local conversation history, light and dark themes, and optional image generation and a gallery for locally saved images. The WebUI uses Python 3.10+ and the standard library.
+A lightweight browser interface for Atomic Server. It provides streaming text chat, browser-local conversation history, light and dark themes, optional image generation and a gallery for locally saved images, and opt-in model management. The WebUI uses Python 3.10+ and the standard library.
 
 ## Screenshots
 
@@ -10,9 +10,13 @@ Captured with a local mock API and sample content.
 
 ![Dark mode Chat view with conversation history, a model selector, and a completed reply](docs/screenshots/chat-dark.png)
 
-### Images in light mode
+### Models in dark mode
 
-![Light mode Images view with an image prompt, a mountain lake preview, and a gallery link](docs/screenshots/images-light.png)
+![Dark mode Models view with catalog search, a download review, installed models, and download status](docs/screenshots/models-dark.png)
+
+### Images and gallery in light mode
+
+![Light mode Images view with an image prompt and the local gallery's Save and Delete actions](docs/screenshots/images-light.png)
 
 ## One-shot install
 
@@ -87,6 +91,9 @@ python3 server.py
 | `ATC_WEBUI_PUBLIC_ORIGIN` | Unset | Browser-facing origin such as `https://webui.example.org`, without a trailing slash. Required for a wildcard bind. Set this when using a reverse proxy. |
 | `ATC_WEBUI_IMAGE_MODEL` | Unset | Use the currently loaded Atomic image model when unset. Set an identifier to request a specific model, or set an empty value to disable image generation. |
 | `ATC_WEBUI_CONTROL_DATA_DIR` | Unset | Absolute path to the local Atomic Server data directory. Enables the sidebar's local image model status and, with automatic model selection, live generation progress. |
+| `ATC_WEBUI_MODEL_CONTROL` | Disabled | Set to `1` to enable the Models tab on loopback or a directly connected private LAN. |
+| `ATC_WEBUI_ATC_BIN` | `atc` on PATH | Optional absolute path to the Atomic Server CLI. |
+| `ATC_WEBUI_ATC_DATA_FOLDER` | Atomic CLI default | Optional absolute path to the data folder of the Atomic instance serving `ATC_API_URL`. |
 | `ATC_WEBUI_GALLERY_URL` | Unset | Optional gallery link presented in the Images view. |
 | `ATC_WEBUI_GALLERY_DIR` | Unset | Absolute path to the local Atomic image directory. Enables the gallery in the Images view. |
 | `ATC_WEBUI_REF` | `main` | Installer-only Git branch, tag, or commit to download. |
@@ -117,9 +124,24 @@ Use a directory controlled by the Atomic Server account and readable by the WebU
 
 Hover over a gallery image or focus it with the keyboard to reveal **Save** and **Delete**. Both actions are always visible on touch devices. **Save** downloads a full-size PNG. **Delete** permanently removes the image and its thumbnail after confirmation. If the WebUI can write to the image directory, anyone with WebUI access can delete images.
 
+## Manage local models
+
+> [!WARNING]
+> **Model controls currently have no WebUI authentication.** Anyone who can reach an enabled instance on the LAN can start multi-gigabyte downloads, consume disk space and bandwidth, and load models that may displace running models or interrupt inference. The Atomic API token authenticates WebUI requests to Atomic Server. **Enable model controls only on a trusted private network and keep the WebUI off the public internet.** WebUI authentication is planned for a later release.
+
+Run WebUI and Atomic Server under the same account. Use Atomic Server 0.2.21, keep `ATC_API_URL` on loopback, and set `ATC_WEBUI_MODEL_CONTROL=1` in the launcher configuration or environment. For LAN access, configure the WebUI host and public origin as shown below. Model controls accept direct connections from private IPv4 and unique-local IPv6 addresses when the WebUI is bound for network access.
+
+Use the loopback URL for `ATC_API_URL` even if Atomic reports a wildcard bind. For example, a listener at `0.0.0.0:1339` is reachable by the WebUI at `http://127.0.0.1:1339`.
+
+In **Models**, browse the Atomic catalog or search by name or Hugging Face repository ID. Chat search offers GGUF and the MLX or managed safetensors engines reported for the host. Image search covers Atomic catalog variants. Choose a variant, review its size and compatibility, then select **Download**. Atomic owns the job, and the **Downloads** list can show its progress after a page reload. Retrying the same confirmation after a request error reuses its request ID. Use Atomic Server's native controls to resume a job that reports a failed or interrupted state.
+
+After downloading, choose a model under **Installed models** and select **Load model**. Loading may replace a model on the same device. Chat refreshes its available models after a successful load. Images uses the active Atomic image model unless `ATC_WEBUI_IMAGE_MODEL` specifies a model.
+
+Model selectors use the full width of their sections. The Models view uses two columns on wider screens and stacks the sections on narrower screens.
+
 ## Network access
 
-For remote access, keep the WebUI bound to loopback behind an HTTPS reverse proxy. Require separate access authentication at the proxy. The Atomic API token authenticates only the WebUI's upstream requests.
+For remote access to Chat and Images, keep the WebUI bound to loopback behind an HTTPS reverse proxy and require separate access authentication at the proxy. Leave model controls disabled on that instance.
 
 Set `ATC_WEBUI_PUBLIC_ORIGIN` to the external HTTPS origin and preserve the incoming host. Disable proxy buffering for streamed replies. Chat and discovery use 15-second upstream I/O waits and a 180-second client connection deadline. Image generation allows up to 10 minutes for the upstream job and additional time for connection setup and response delivery. Set the reverse proxy's read timeout accordingly, since Atomic returns the image only after generation finishes. The WebUI accepts up to 16 concurrent connections with at most two image requests. Additional image requests return HTTP 503 while both image slots are occupied. This example belongs inside an existing Nginx HTTPS server configuration.
 

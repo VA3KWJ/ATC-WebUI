@@ -114,12 +114,12 @@ button:enabled:hover, .action-link:hover { filter: brightness(.92); }
   gap: .85rem;
 }
 
-.navigation { display: flex; gap: .35rem; }
+.navigation { display: flex; flex-wrap: wrap; gap: .35rem; }
 .navigation button, .history button, .history-heading button {
   background: transparent;
   color: var(--text);
 }
-.navigation button { flex: 1; }
+.navigation button { flex: 1 1 auto; padding-inline: .55rem; }
 .navigation button[aria-pressed="true"], .history button[aria-current="true"] {
   background: var(--raised);
   border-color: var(--border);
@@ -339,4 +339,45 @@ textarea::placeholder { color: var(--muted); }
     --available: #186647;
     --error: #a12c2b;
   }
+}
+
+#models-panel { min-height: 0; }
+
+.model-management {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: clamp(.75rem, 1.7vw, 1.25rem);
+  padding: clamp(.85rem, 2.5vw, 1.6rem);
+}
+
+.model-management .composer {
+  min-width: 0;
+  align-content: start;
+  gap: .45rem;
+  padding: clamp(.75rem, 1.4vw, 1rem);
+  border: 1px solid var(--border);
+  border-radius: .7rem;
+}
+
+.model-management h2, .model-management p, .model-management ul { margin-block: 0; }
+.model-management h2 { font-size: 1rem; }
+.model-management h2 + *, .model-management .actions,
+.model-management :is(select, input) + label { margin-top: .25rem; }
+.model-management select, .model-management input { width: 100%; min-width: 0; max-width: none; }
+.model-management :is(p, li) { overflow-wrap: anywhere; }
+.model-management ul { padding-inline-start: 1.15rem; }
+.model-management li + li { margin-top: .4rem; }
+.model-management input {
+  font: inherit;
+  min-height: 2.65rem;
+  border: 1px solid var(--border);
+  border-radius: .55rem;
+  padding: .5rem .8rem;
+  background: var(--surface);
+  color: var(--text);
+}
+
+@media (max-width: 61rem) {
+  .model-management { grid-template-columns: minmax(0, 1fr); }
 }

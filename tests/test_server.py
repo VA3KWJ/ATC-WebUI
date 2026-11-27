@@ -93,6 +93,22 @@ class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.env = {"ATC_API_URL": "http://127.0.0.1:8040"}
 
+    def test_model_controls_allow_lan_with_an_explicit_origin_and_local_atomic(self):
+        env = self.env | {"ATC_API_TOKEN": TOKEN, "ATC_WEBUI_MODEL_CONTROL": "1"}
+        self.assertTrue(server.Config.from_env(env).model_control)
+        self.assertTrue(server.Config.from_env(env | {
+            "ATC_WEBUI_HOST": "0.0.0.0", "ATC_WEBUI_PUBLIC_ORIGIN": "http://172.16.120.22:8080",
+        }).model_control)
+        for overrides in (
+            {"ATC_WEBUI_HOST": "192.0.2.1"},
+            {"ATC_WEBUI_PUBLIC_ORIGIN": "https://example.test"},
+            {"ATC_API_URL": "https://example.test"},
+            {"ATC_WEBUI_ATC_BIN": "relative/atc"},
+            {"ATC_WEBUI_ATC_DATA_FOLDER": "relative/data"},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(server.ConfigurationError):
+                server.Config.from_env(env | overrides)
+
     def test_requires_exactly_one_valid_bearer_source(self):
         for overrides in (
             {},
@@ -234,6 +250,61 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(
             self.upstream.calls.get(timeout=1), (method, route, f"Bearer {TOKEN}", payload),
         )
+
+    def test_model_control_routes_require_direct_access_and_write_origin(self):
+        route = "/api/model-control/catalog"
+        payload = {"category": "text"}
+        with self.response(route, payload) as response:
+            self.assertEqual(response.status, 404)
+        control = server.ModelControl("atc", None, self.ui.config.upstream, TOKEN)
+        origin = f"http://127.0.0.1:{self.ui.server_port}"
+        with patch.object(self.ui, "model_control", control), patch.object(
+            control, "dispatch", return_value={"models": []},
+        ) as dispatch:
+            for headers, expected in (
+                ({}, 403),
+                ({"Origin": "https://example.test"}, 403),
+                ({"Origin": origin, "Sec-Fetch-Site": "cross-site"}, 403),
+                ({"Origin": origin, "X-Forwarded-For": "127.0.0.1"}, 404),
+                ({"Origin": origin, "Forwarded": "for=127.0.0.1"}, 404),
+            ):
+                with self.subTest(headers=headers), self.response(route, payload, headers) as response:
+                    self.assertEqual(response.status, expected)
+            receive = self.ui.finish_request
+            with patch.object(self.ui, "finish_request",
+                              side_effect=lambda request, _: receive(request, ("192.0.2.1", 1234))):
+                with self.response(route, payload, {"Origin": origin}) as response:
+                    self.assertEqual(response.status, 404)
+            dispatch.assert_not_called()
+            with self.response(route, payload, {"Origin": origin}) as response:
+                self.assertEqual(response.status, 200)
+            dispatch.assert_called_once_with("catalog", "POST", payload)
+
+    def test_model_control_accepts_same_origin_writes_from_private_lan_peers(self):
+        control = server.ModelControl("atc", None, self.ui.config.upstream, TOKEN)
+        origin = "http://172.16.120.22:8080"
+        route = "/api/model-control/catalog"
+        payload = {"category": "image"}
+        headers = {"Host": "172.16.120.22:8080", "Origin": origin}
+        config = replace(self.ui.config, address="0.0.0.0", public_origin=origin)
+        receive = self.ui.finish_request
+        with patch.object(self.ui, "model_control", control), patch.object(self.ui, "config", config), patch.object(
+            control, "dispatch", return_value={"models": []},
+        ) as dispatch:
+            for peer, request_headers, expected in (
+                ("172.16.120.50", headers, 200),
+                ("::ffff:172.16.120.50", headers, 200),
+                ("fd00::50", headers, 200),
+                ("8.8.8.8", headers, 404),
+                ("172.16.120.50", headers | {"Origin": "http://example.test"}, 403),
+                ("172.16.120.50", headers | {"X-Forwarded-For": "172.16.120.50"}, 404),
+            ):
+                with self.subTest(peer=peer, expected=expected), patch.object(
+                    self.ui, "finish_request", side_effect=lambda request, _: receive(request, (peer, 1234)),
+                ):
+                    with self.response(route, payload, request_headers) as response:
+                        self.assertEqual(response.status, expected)
+            self.assertEqual(dispatch.call_count, 3)
 
     @contextmanager
     def image_control(self):
@@ -447,6 +518,7 @@ class WebUITests(unittest.TestCase):
         with self.response("/api/config") as response:
             self.assertEqual(json.load(response), {
                 "gallery_url": "https://gallery.example.test/", "gallery_enabled": False, "image_enabled": True,
+                "model_control_enabled": False,
             })
 
     def test_gallery_lists_bounded_pages_newest_first(self):

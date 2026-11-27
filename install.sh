@@ -112,7 +112,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-FILES = ("server.py", "static/index.html", "static/app.js", "static/style.css")
+FILES = ("server.py", "model_control.py", "static/index.html", "static/app.js", "static/style.css")
 
 
 def check_ancestors(path):

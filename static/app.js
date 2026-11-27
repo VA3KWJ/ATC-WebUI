@@ -171,6 +171,8 @@ function currentConversation() {
 function showView(view) {
   elements.chat.hidden = view !== "chat";
   elements.images.hidden = view !== "images";
+  elements["models-panel"].hidden = view !== "models";
+  elements["models-view"].setAttribute("aria-pressed", String(view === "models"));
   elements["chat-view"].setAttribute("aria-pressed", String(view === "chat"));
   elements["image-view"].setAttribute("aria-pressed", String(view === "images"));
   if (view === "images" && !state.gallery.loaded && !state.gallery.request) loadGallery();
@@ -308,6 +310,7 @@ async function refreshModels() {
     state.loadingModels = false;
     renderModels(previous);
     updateControls();
+    refreshChatAfterLoad();
   }
 }
 
@@ -347,6 +350,7 @@ async function loadImageConfig() {
   try {
     const response = await request("/api/config");
     const config = await response.json();
+    elements["models-view"].hidden = config.model_control_enabled !== true;
     state.imageEnabled = config.image_enabled === true;
     state.gallery.enabled = config.gallery_enabled === true;
     elements["local-gallery"].hidden = !state.gallery.enabled;
@@ -636,6 +640,7 @@ async function submitChat(event) {
       saveTurn(turnKey, conversation.id, turn);
     }
     state.chatRequest = null;
+    refreshChatAfterLoad();
     elements["chat-prompt"].readOnly = false;
     renderHistory();
     updateControls();
@@ -768,6 +773,252 @@ function updateThemeLabel() {
   elements.theme.textContent = current === "light" ? "Dark theme" : "Light theme";
 }
 
+const modelManagement = {
+  reviewing: null,
+  browseVersion: 0,
+  variantVersion: 0,
+  reviewVersion: 0,
+  pollTimer: null,
+  polling: false,
+  load: null,
+  loadTicket: null,
+  atomicLoadBusy: false,
+  startingLoad: false,
+  lastDownloads: null,
+  refreshChat: false,
+};
+
+const modelControlErrors = {
+  model_control_unavailable: "The Atomic CLI is unavailable.",
+  model_control_stopped: "Atomic Server was not found in the configured data folder. Check the folder and server status.",
+  model_control_instance: "Atomic Server is running, but its public API does not match this WebUI. Check ATC_API_URL and the API listener.",
+  model_control_failed: "Atomic could not complete this operation. Check the local Atomic status and logs.",
+  model_control_response: "Atomic returned an unexpected model-control response.",
+  model_control_busy: "Model controls are busy. Try again shortly.",
+  model_control_stale: "This selection has expired or is unavailable. Refresh the list and try again.",
+  model_control_provider: "That engine is unavailable on this host.",
+  model_control_timeout: "Atomic did not respond in time. Check its status before trying again.",
+};
+Object.assign(errors, modelControlErrors);
+
+function refreshChatAfterLoad() {
+  if (!modelManagement.refreshChat || state.chatRequest || state.loadingModels) return;
+  modelManagement.refreshChat = false;
+  refreshModels();
+}
+
+async function controlRequest(route, payload) {
+  const path = "/api/model-control/" + route;
+  const response = payload === undefined ? await request(path) : await postJson(path, payload);
+  return response.json();
+}
+
+function fillModelSelect(select, rows, empty) {
+  const selected = select.value;
+  select.replaceChildren();
+  for (const row of rows.length ? rows : [{ id: "", label: empty }]) {
+    const option = document.createElement("option");
+    option.value = row.id;
+    option.textContent = row.label;
+    select.append(option);
+  }
+  if (rows.some(({ id }) => id === selected)) select.value = selected;
+  select.disabled = !rows.length;
+}
+
+function modelBytes(bytes) {
+  if (!Number.isSafeInteger(bytes)) return "Size unavailable";
+  const gigabytes = bytes / (1024 ** 3);
+  return gigabytes >= 1 ? gigabytes.toFixed(2) + " GiB" : (bytes / (1024 ** 2)).toFixed(1) + " MiB";
+}
+
+function clearDownloadReview() {
+  modelManagement.reviewing = null;
+  modelManagement.reviewVersion++;
+  elements["start-download"].hidden = true;
+  elements["start-download"].disabled = true;
+  feedback("download-review", "");
+}
+
+async function refreshVariants() {
+  clearDownloadReview();
+  const version = ++modelManagement.variantVersion;
+  const id = elements["download-model"].value;
+  fillModelSelect(elements["download-variant"], [], id ? "Checking variants…" : "Choose a model");
+  elements["review-download"].disabled = true;
+  if (!id) return;
+  try {
+    const { variants } = await controlRequest("variants", { id });
+    if (version !== modelManagement.variantVersion) return;
+    fillModelSelect(elements["download-variant"], variants, "No supported variants");
+    elements["review-download"].disabled = !variants.length;
+  } catch (error) {
+    if (version !== modelManagement.variantVersion) return;
+    fillModelSelect(elements["download-variant"], [], "Variants unavailable");
+    feedback("download-review", error.message, "error");
+  }
+}
+
+async function browseModelCatalog(search = false) {
+  const version = ++modelManagement.browseVersion;
+  const category = elements["model-category"].value;
+  const provider = category === "text" ? elements["model-provider"].value : "";
+  elements["model-provider"].hidden = category !== "text";
+  elements["model-provider-label"].hidden = category !== "text";
+  fillModelSelect(elements["download-model"], [], "Checking catalog…");
+  refreshVariants();
+  try {
+    const result = await controlRequest(search ? "search" : "catalog", {
+      category, provider, query: search ? elements["model-query"].value : "",
+    });
+    if (version !== modelManagement.browseVersion) return;
+    fillModelSelect(elements["model-provider"], result.providers.map((id) => ({
+      id, label: id === "gguf" ? "GGUF (automatic engine)" : id,
+    })),
+      "No compatible engine");
+    elements["model-provider"].value = result.provider ?? "";
+    fillModelSelect(elements["download-model"], result.models, "No models found");
+    await refreshVariants();
+  } catch (error) {
+    if (version !== modelManagement.browseVersion) return;
+    fillModelSelect(elements["download-model"], [], "Catalog unavailable");
+    feedback("download-review", error.message, "error");
+  }
+}
+
+async function reviewModelDownload() {
+  clearDownloadReview();
+  const version = modelManagement.reviewVersion;
+  const id = elements["download-variant"].value;
+  if (!id) return;
+  const variant = elements["download-variant"].selectedOptions[0].textContent;
+  elements["review-download"].disabled = true;
+  feedback("download-review", "Reviewing download…");
+  try {
+    const review = await controlRequest("review", { id });
+    if (version !== modelManagement.reviewVersion) return;
+    modelManagement.reviewing = review.id;
+    const details = [variant, modelBytes(review.bytes), review.provider, review.verdict, ...review.blockers];
+    feedback("download-review", details.filter(Boolean).join(" · "), review.blocked ? "error" : "");
+    elements["start-download"].hidden = review.blocked || !review.id;
+    elements["start-download"].disabled = elements["start-download"].hidden;
+  } catch (error) {
+    if (version === modelManagement.reviewVersion) feedback("download-review", error.message, "error");
+  } finally {
+    if (version === modelManagement.reviewVersion) elements["review-download"].disabled = false;
+  }
+}
+
+async function startModelDownload() {
+  const id = modelManagement.reviewing;
+  if (!id || elements["start-download"].disabled) return;
+  elements["start-download"].disabled = true;
+  try {
+    await controlRequest("download", { id });
+    if (id === modelManagement.reviewing) {
+      clearDownloadReview();
+      feedback("download-review", "Download accepted by Atomic.");
+    }
+    pollModelJobs();
+  } catch (error) {
+    if (id !== modelManagement.reviewing) return;
+    feedback("download-review", error.message, "error");
+    elements["start-download"].disabled = false;
+  }
+}
+
+function updateLoadButton() {
+  elements["load-model"].disabled = !elements["installed-model"].value
+    || modelManagement.startingLoad || modelManagement.atomicLoadBusy || modelManagement.load?.status === "loading";
+}
+
+async function refreshInstalledModels() {
+  try {
+    const { models } = await controlRequest("installed");
+    fillModelSelect(elements["installed-model"], models.map((model) => ({
+      id: model.id, label: model.label + " · " + model.provider,
+    })), "No installed models");
+  } catch (error) {
+    feedback("load-model-status", error.message, "error");
+  } finally {
+    updateLoadButton();
+  }
+}
+
+async function startModelLoad() {
+  if (elements["load-model"].disabled) return;
+  modelManagement.startingLoad = true;
+  updateLoadButton();
+  feedback("load-model-status", "Starting model load…");
+  try {
+    const { load } = await controlRequest("load", { id: elements["installed-model"].value });
+    modelManagement.loadTicket = load.id;
+    if (modelManagement.load?.id !== load.id || modelManagement.load.status === "loading") {
+      modelManagement.load = load;
+    }
+    pollModelJobs();
+  } catch (error) {
+    feedback("load-model-status", error.message, "error");
+  } finally {
+    modelManagement.startingLoad = false;
+    updateLoadButton();
+  }
+}
+
+async function pollModelJobs() {
+  const shouldPoll = () => !elements["models-panel"].hidden || Boolean(modelManagement.loadTicket);
+  if (modelManagement.polling || !shouldPoll()) return;
+  clearTimeout(modelManagement.pollTimer);
+  modelManagement.polling = true;
+  try {
+    const { downloads, loads } = await controlRequest("status");
+    modelManagement.atomicLoadBusy = loads.some((entry) => entry.status === "loading");
+    const load = modelManagement.loadTicket
+      ? loads.find((entry) => entry.id === modelManagement.loadTicket) : loads[0];
+    const rows = downloads.map((job) => {
+      const row = document.createElement("li");
+      row.textContent = job.label + " · " + job.status;
+      if (job.bytes !== null && job.total !== null) {
+        row.textContent += " · " + modelBytes(job.bytes) + " / " + modelBytes(job.total);
+      }
+      return row;
+    });
+    elements["model-downloads"].replaceChildren(...rows);
+    feedback("model-jobs-status", rows.length ? "" : "No model downloads.");
+    const completed = JSON.stringify(downloads.filter((job) => !job.active));
+    if (modelManagement.lastDownloads !== null && completed !== modelManagement.lastDownloads) {
+      refreshInstalledModels();
+    }
+    modelManagement.lastDownloads = completed;
+
+    if (load) {
+      const previous = modelManagement.load;
+      modelManagement.load = load;
+      if (load.status === "loading") feedback("load-model-status", "Loading " + load.label + "…");
+      if (load.status === "failed") {
+        modelManagement.loadTicket = null;
+        feedback("load-model-status", describeError(load.error, "Model load failed."), "error");
+      }
+      if (load.status === "ready" && (previous?.id !== load.id || previous.status !== "ready")) {
+        modelManagement.loadTicket = null;
+        feedback("load-model-status", load.label + " loaded.", "available");
+        if (load.category === "text") {
+          modelManagement.refreshChat = true;
+          refreshChatAfterLoad();
+        } else {
+          refreshImageModel();
+        }
+      }
+    }
+  } catch (error) {
+    feedback("model-jobs-status", error.message, "error");
+  } finally {
+    modelManagement.polling = false;
+    updateLoadButton();
+    if (shouldPoll()) modelManagement.pollTimer = setTimeout(pollModelJobs, 3000);
+  }
+}
+
 const storedTheme = readStorage(THEME_KEY);
 if (["light", "dark"].includes(storedTheme)) document.documentElement.dataset.theme = storedTheme;
 updateThemeLabel();
@@ -781,6 +1032,29 @@ elements.theme.addEventListener("click", () => {
 });
 elements["chat-view"].addEventListener("click", () => showView("chat"));
 elements["image-view"].addEventListener("click", () => showView("images"));
+elements["models-view"].addEventListener("click", () => {
+  if (!elements["models-panel"].hidden) return;
+  showView("models");
+  browseModelCatalog();
+  refreshInstalledModels().then(pollModelJobs);
+});
+elements["model-search"].addEventListener("submit", (event) => {
+  event.preventDefault();
+  browseModelCatalog(true);
+});
+elements["model-catalog"].addEventListener("click", () => browseModelCatalog());
+elements["model-category"].addEventListener("change", () => browseModelCatalog());
+elements["model-provider"].addEventListener("change", () => browseModelCatalog());
+elements["download-model"].addEventListener("change", refreshVariants);
+elements["download-variant"].addEventListener("change", () => {
+  clearDownloadReview();
+  elements["review-download"].disabled = !elements["download-variant"].value;
+});
+elements["review-download"].addEventListener("click", reviewModelDownload);
+elements["start-download"].addEventListener("click", startModelDownload);
+elements["installed-model"].addEventListener("change", updateLoadButton);
+elements["load-model"].addEventListener("click", startModelLoad);
+elements["refresh-installed"].addEventListener("click", refreshInstalledModels);
 elements["new-chat"].addEventListener("click", () => {
   state.activeId = null;
   elements["chat-prompt"].value = "";

@@ -38,3 +38,9 @@ The WebUI targets Atomic Server 0.2.21 with Atomic Core 0.24.8. The installed ve
 
 - Unauthenticated model discovery returned HTTP `401`. A temporary WebUI using the existing public API client key served its page and returned HTTP `200` with an empty model list from `GET /api/models`.
 - No suitable live chat model was available, so successful live streaming remains unverified. Live image generation and its base64 response remain unverified. Creating a live gallery image requires separate approval.
+
+## Local model controls
+
+- Model management uses the local Atomic Server 0.2.21 typed CLI. The public API remains the source for chat model discovery and inference.
+- Read-only checks against an isolated Atomic instance verified engine discovery, catalog and repository response shapes, installed inventory, job status, and GGUF, image, and managed model install plans. A separate smoke check exercised catalog search, image review, inventory, and status through WebUI HTTP routes.
+- Downloads and loads were exercised with mocks. Disposable desktop and mobile Chromium sessions verified download confirmation, progress after reload, and load completion.
